@@ -82,7 +82,7 @@ With the fix on, the worst spot is CPU-limited: the GPU is idle most of the fram
 
 ## A 1-hour session
 
-51 minutes of normal play in fix-only mode (`Measure=0`), with a pre-release build:
+51 minutes of normal play in fix-only mode (`Measure=0`), with an earlier build:
 
 - 612 stats blocks of 5 s. Average 54.8 FPS; 482 blocks at 50 FPS or more, 2 below 20 FPS (loading).
 - 7 heaps of 32 MB were created: 5 in the window, 2 after it was full. That build kept those 2 in the driver's

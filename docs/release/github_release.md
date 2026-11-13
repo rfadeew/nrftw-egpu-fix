@@ -1,5 +1,5 @@
-<!-- Tag: v0.1.0-beta (matches the version inside the DLL and the zip name) | Title: No Rest for the Wicked eGPU Fix v0.1.0 | Set as the latest release -->
-<!-- Attach: dist/No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip. SHA-256 below match this zip; rerun package.bat and update them if the code changes. -->
+<!-- Tag: v0.1.0 | Title: No Rest for the Wicked eGPU Fix v0.1.0 | Set as the latest release -->
+<!-- Attach: dist/No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0.zip. SHA-256 below match this zip; rerun package.bat and update them if the code changes. -->
 
 **Performance fix for NVIDIA eGPUs without Resizable BAR** (Thunderbolt / USB4). Please read the limitations
 below and report your results.
@@ -24,7 +24,7 @@ window (BAR1) through NVAPI, so the GPU reads them from its own VRAM. Game files
 
 ## Install
 
-1. Download `No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip` below.
+1. Download `No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0.zip` below.
 2. Copy `version.dll` and `egpu_fix.ini` into the game folder (Steam → right-click the game → *Manage* →
    *Browse local files*).
 3. Start the game. `egpu_proxy.log` in the game folder should contain `vidmem: stage 2c ON` and `-> VRAM` lines.
@@ -70,8 +70,8 @@ that log.
 ## Checksums (SHA-256)
 
 ```
-09def442d91163248e2cd888f0880947b103c987f3fef4f3441475458cf0e4aa  No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip
-44774573fa37455108efd21caf7cc72513a529e33b0a6d3a752376bb2d9064b6  version.dll
+3dbe805a4f54b85e14b72291b96fde3cc66a2cdd04f1ade6c2f5470500beddd1  No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0.zip
+fa630d6739a45209d24af5d4c016c2b711831ee802ec5db1324c952eb3a06779  version.dll
 ```
 
 MIT License. Uses [MinHook](https://github.com/TsudaKageyu/minhook) (BSD 2-clause). Not affiliated with Moon

@@ -9,7 +9,7 @@ No Rest for the Wicked eGPU Fix
 
 ## Version
 
-0.1.0-beta
+0.1.0
 
 ## Category
 
@@ -18,13 +18,13 @@ Performance? Use "Miscellaneous" if the game has no Performance category.
 ## Brief overview (short summary, max ~350 characters)
 
 Up to 3x FPS on NVIDIA eGPUs without Resizable BAR (Thunderbolt/USB4). A version.dll proxy that moves the game's
-per-frame upload heaps into the GPU's CPU-visible VRAM window through NVAPI. Public beta: tested on one system.
+per-frame upload heaps into the GPU's CPU-visible VRAM window through NVAPI. Tested on one system so far.
 Switches itself off on ReBAR, AMD and Intel GPUs.
 
 ## File to upload
 
-`No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip` (from `dist\`). Main file, version 0.1.0-beta.
-File description: "Public beta. Copy version.dll and egpu_fix.ini into the game folder."
+`No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0.zip` (from `dist\`). Main file, version 0.1.0.
+File description: "Copy version.dll and egpu_fix.ini into the game folder."
 
 ## Tags and checkboxes to review
 
@@ -51,7 +51,7 @@ Results on the test system (i7-12700H laptop, Thunderbolt 4, RTX 5070 Ti eGPU wi
 - Lighter spot: 29 FPS -> 50-59 FPS (60 FPS cap)
 Measured with the mod's own GPU timing. Your results will differ.
 
-PUBLIC BETA: tested on one system, including a 1-hour play session. Known limitations:
+Tested on one system so far, including a 1-hour play session. Known limitations:
 - CPU writes into the VRAM window are slow, so heavy scenes can become CPU-limited instead of GPU-limited.
 - Only 160-192 MB of the 256 MB window is usable. Data that does not fit stays in system memory, as without the mod.
 - Online co-op and sessions longer than an hour are not tested yet. The game has no anti-cheat (Steam build 22928553), and the mod does not touch game logic, saves or network traffic. Still, use it online at your own risk.
@@ -115,7 +115,7 @@ Before a build goes into the game, an automated test renders with it and checks 
 
 ```bbcode
 [size=5][b]No Rest for the Wicked eGPU Fix[/b][/size]
-[b][color=#ff9900]PUBLIC BETA[/color][/b] for [b]NVIDIA eGPUs without Resizable BAR[/b] (Thunderbolt / USB4 enclosures). It has been tested on one system only. Please read the known issues and report your results.
+Performance fix for [b]NVIDIA eGPUs without Resizable BAR[/b] (Thunderbolt / USB4 enclosures). It has been tested on one system so far. Please read the known issues and report your results.
 
 [size=4][b]What it does[/b][/size]
 No Rest for the Wicked reads its per-frame vertex, shader-resource and constant data from D3D12 "upload" heaps in system memory. Over Thunderbolt without ReBAR every one of those GPU reads crosses a slow link, and the GPU spends most of the frame waiting. On the test system an RTX 5070 Ti eGPU was slower than the laptop's internal RTX 3060.

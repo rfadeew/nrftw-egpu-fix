@@ -5,15 +5,15 @@ Markdown mode. Replace `NEXUS_URL` (or use the GitHub Releases link). Check the 
 
 ## Title
 
-No Rest for the Wicked: 13.7 → 42 FPS on a TB4 eGPU without ReBAR by moving UPLOAD heaps into BAR1 (NVAPI, open-source beta)
+No Rest for the Wicked: 13.7 → 42 FPS on a TB4 eGPU without ReBAR by moving UPLOAD heaps into BAR1 (NVAPI, open source)
 
 ## Body
 
 TL;DR: *No Rest for the Wicked* reads its per-frame vertex, constant and SRV data straight from D3D12 `UPLOAD`
 heaps in system memory. Over Thunderbolt without ReBAR, that makes the GPU stall most of the frame. I wrote a
 `version.dll` proxy that creates those heaps in the 256 MB CPU-visible VRAM window (BAR1) through
-`NvAPI_D3D12_CreateHeap2` + `NV_D3D12_HEAP_FLAG_CPUVISIBLE_VIDMEM`. Worst spot: 13.7 → 42 FPS. Public beta,
-NVIDIA only, looking for testers with other setups.
+`NvAPI_D3D12_CreateHeap2` + `NV_D3D12_HEAP_FLAG_CPUVISIBLE_VIDMEM`. Worst spot: 13.7 → 42 FPS. NVIDIA only;
+looking for testers with other setups.
 
 **Setup**
 
@@ -59,7 +59,7 @@ NVIDIA only, looking for testers with other setups.
 
 **Limitations**
 
-- Beta, one test system. NVIDIA only. With ReBAR, or on AMD/Intel, it switches itself off.
+- Tested on one system so far. NVIDIA only. With ReBAR, or on AMD/Intel, it switches itself off.
 - Tested in one 1-hour session; longer sessions and online co-op are not tested yet. The game has no anti-cheat, and the mod does not touch game
   logic or the network. Still, use it online at your own risk.
 - To uninstall, delete `version.dll` and `egpu_fix.ini` from the game folder.

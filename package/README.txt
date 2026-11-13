@@ -1,5 +1,5 @@
-No Rest for the Wicked eGPU Fix - v0.1.0-beta (PUBLIC BETA)
-=============================================================
+No Rest for the Wicked eGPU Fix - v0.1.0
+========================================
 
 Speeds up No Rest for the Wicked on NVIDIA eGPUs without Resizable BAR
 (Thunderbolt / USB4 enclosures). Game files are not modified.
@@ -28,7 +28,7 @@ REPORTING PROBLEMS
   that log. The log contains no user names or folder paths.
 
 KNOWN LIMITATIONS
-  - Beta, tested on one system (i7-12700H laptop, TB4, RTX 5070 Ti eGPU,
+  - Tested on one system so far (i7-12700H laptop, TB4, RTX 5070 Ti eGPU,
     driver 617.42, Windows 11 25H2).
   - CPU writes to the moved buffers are slower; heavy scenes can become
     CPU-limited instead of GPU-limited.

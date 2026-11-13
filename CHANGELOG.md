@@ -1,8 +1,8 @@
 # Changelog
 
-## v0.1.0-beta (unreleased)
+## v0.1.0 (2026-11-13)
 
-First public beta.
+First public release.
 
 - `version.dll` proxy: forwards every `version.dll` export to `System32`, hooks D3D12 heap creation (MinHook).
 - The fix: the game's `UPLOAD` heaps are created in CPU-visible VRAM (BAR1) through

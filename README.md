@@ -1,12 +1,12 @@
 # No Rest for the Wicked eGPU Fix
 
-**Public beta.** A small `version.dll` proxy that makes *No Rest for the Wicked* (NRFTW) run much faster on
+A small `version.dll` proxy that makes *No Rest for the Wicked* (NRFTW) run much faster on
 **NVIDIA eGPUs without Resizable BAR** (Thunderbolt / USB4 enclosures). Game files are not modified.
 
 On the test system the worst spot went from **13.7 to 42 FPS**. A lighter spot went from **29 to 50–59 FPS**
 (60 FPS cap).
 
-> This is a beta, tested on one system. Read [Limitations](#limitations-and-trade-offs) before you install it.
+> Tested on one system so far. Read [Limitations](#limitations-and-trade-offs) before you install it.
 
 ## Who it is for
 
@@ -40,7 +40,7 @@ Your numbers will differ. With the fix on, the worst spot becomes CPU-limited on
 
 ## Install
 
-1. Download `No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip` from the
+1. Download `No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0.zip` from the
    [Releases](../../releases) page.
 2. Open the game folder. In Steam: right-click the game → *Manage* → *Browse local files*. It is the folder that
    contains `NoRestForTheWicked.exe`.

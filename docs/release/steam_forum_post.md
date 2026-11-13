@@ -4,12 +4,12 @@ Steam markup. Replace `NEXUS_URL` before you post (or use the GitHub Releases li
 
 ## Title
 
-[Mod, beta] eGPU without ReBAR: 13.7 → 42 FPS with a small fix (NVIDIA, Thunderbolt)
+[Mod] eGPU without ReBAR: 13.7 → 42 FPS with a small fix (NVIDIA, Thunderbolt)
 
 ## Body
 
 ```
-If you play on an NVIDIA eGPU over Thunderbolt / USB4, you may have noticed that the game runs much worse than the GPU should allow. Sometimes it is even slower than a weaker internal GPU. I found the cause and made a small fix. It is a [b]public beta[/b], tested on one system so far, and I am looking for more eGPU testers.
+If you play on an NVIDIA eGPU over Thunderbolt / USB4, you may have noticed that the game runs much worse than the GPU should allow. Sometimes it is even slower than a weaker internal GPU. I found the cause and made a small fix. It has been tested on one system so far, and I am looking for more eGPU testers.
 
 [h2]The cause[/h2]
 The game reads a lot of per-frame data (vertices, shader data, constants) directly from system memory. In a desktop PC that is fast. Over Thunderbolt without Resizable BAR every one of those GPU reads crosses a slow, high-latency link, and the GPU spends most of the frame waiting.
