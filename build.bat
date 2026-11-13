@@ -23,10 +23,14 @@ rc /nologo /Isrc /fo build\egpu_fix.res src\egpu_fix.rc
 if errorlevel 1 (echo BUILD FAILED & exit /b 1)
 
 rem /PDBALTPATH keeps only "version.pdb" in the DLL's debug directory (no local build path in the release file).
-cl /nologo /LD /O2 /W3 /EHsc /std:c++17 /MT /Zi /DUNICODE /D_UNICODE ^
+rem /Brepro + fresh PDBs: reproducible output (no timestamps, no reused PDB age), so the same source and
+rem toolset give the same SHA-256.
+if exist build\version.pdb del /q build\version.pdb
+if exist build\vc140.pdb del /q build\vc140.pdb
+cl /nologo /LD /O2 /W3 /EHsc /std:c++17 /MT /Zi /Brepro /DUNICODE /D_UNICODE ^
    /Isrc /Ithird_party\minhook\include /Fobuild\ /Fdbuild\ ^
    %SRC% build\egpu_fix.res ^
    /link /OUT:build\version.dll /PDB:build\version.pdb /PDBALTPATH:%%_PDB%% /IMPLIB:build\version.lib ^
-   /DEBUG /OPT:REF /OPT:ICF
+   /DEBUG /OPT:REF /OPT:ICF /Brepro
 if errorlevel 1 (echo BUILD FAILED & exit /b 1)
 echo Built build\version.dll

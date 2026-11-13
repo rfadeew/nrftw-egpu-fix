@@ -186,8 +186,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
     OSVERSIONINFOW os = { sizeof(os) };
     if (auto rtlGetVersion = (LONG(WINAPI*)(OSVERSIONINFOW*))GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"))
         rtlGetVersion(&os);
-    Log("egpu_fix v%s (built %s) loaded into %ls (pid %lu), Windows %lu.%lu.%lu",
-        EGPU_FIX_VERSION_STR, __DATE__, exeName, GetCurrentProcessId(), os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber);
+    Log("egpu_fix v%s loaded into %ls (pid %lu), Windows %lu.%lu.%lu",
+        EGPU_FIX_VERSION_STR, exeName, GetCurrentProcessId(), os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber);
 
     ReadConfig(iniPath);
     Log("config: Hooks=%d Measure=%d IntervalSec=%d VidmemHeaps=%d VidmemBuffers=%d VidmemBufMaxKB=%d VidmemReserveMB=%d"

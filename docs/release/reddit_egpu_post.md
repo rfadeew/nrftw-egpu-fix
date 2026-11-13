@@ -1,6 +1,6 @@
 # r/eGPU post
 
-Markdown mode. Replace `GITHUB_URL` and `NEXUS_URL`. Check the subreddit rules and flair before you post
+Markdown mode. Replace `NEXUS_URL` (or use the GitHub Releases link). Check the subreddit rules and flair before you post
 (for example "Discussion" or "Guide").
 
 ## Title
@@ -68,5 +68,5 @@ NVIDIA only, looking for testers with other setups.
 plus `egpu_proxy.log` from the game folder (it contains no user names or paths). Set `Measure=1` in
 `egpu_fix.ini` for a detailed log.
 
-- Source (MIT) and write-up: GITHUB_URL
+- Source (MIT) and write-up: https://github.com/rfadeew/nrftw-egpu-fix
 - Download: NEXUS_URL (or GitHub Releases)

@@ -1,7 +1,7 @@
 # Nexus Mods page: fields to fill in
 
 The game section is https://www.nexusmods.com/norestforthewicked.
-Replace `GITHUB_URL` before you upload.
+GitHub links are filled in. Use the GitHub Releases link until the Nexus page exists.
 
 ## Name
 
@@ -59,7 +59,7 @@ PUBLIC BETA: tested on one system, including a 1-hour play session. Known limita
 
 To report a problem, attach egpu_proxy.log from the game folder (it contains no user names or paths) and list your GPU, enclosure, link and CPU. For performance problems, set Measure=1 in egpu_fix.ini first.
 
-Source code (MIT) and technical details: GITHUB_URL
+Source code (MIT) and technical details: https://github.com/rfadeew/nrftw-egpu-fix
 ```
 
 ### Installation instructions
@@ -108,7 +108,7 @@ The AI wrote most of the C++ code: the version.dll proxy, the D3D12 hooks, the N
 
 My part: I found and reproduced the problem on my own eGPU setup. I ran the diagnostics (nvidia-smi, PIX timing and GPU captures) and tested every build in the game. I decided what to try next and checked the results. Every performance number on this page comes from real runs on my hardware, measured by the mod's own logging, and I keep those logs.
 
-Before a build goes into the game, an automated test renders with it and checks the results by reading them back, including a negative test that must fail. The source code is public (MIT), so anyone can review it: GITHUB_URL
+Before a build goes into the game, an automated test renders with it and checks the results by reading them back, including a negative test that must fail. The source code is public (MIT), so anyone can review it: https://github.com/rfadeew/nrftw-egpu-fix
 ```
 
 ## Description (BBCode)
@@ -131,7 +131,7 @@ This mod is a small [b]version.dll[/b] proxy. It creates those heaps in the GPU'
 [*]Worst spot: [b]13.7 FPS -> 42 FPS[/b]. GPU busy time per frame dropped from 73 ms to 7 ms.
 [*]Lighter spot: [b]29 FPS -> 50-59 FPS[/b] (60 FPS cap).
 [/list]
-Measured in the same session at the same spots, with the mod's own logging (GPU timestamps). Your results will differ. Full measurements and technical details: [url=GITHUB_URL/blob/main/docs/how-it-works.md]How it works[/url].
+Measured in the same session at the same spots, with the mod's own logging (GPU timestamps). Your results will differ. Full measurements and technical details: [url=https://github.com/rfadeew/nrftw-egpu-fix/blob/main/docs/how-it-works.md]How it works[/url].
 
 [size=4][b]Who should use it[/b][/size]
 [list]
@@ -176,7 +176,7 @@ egpu_fix.ini has four settings, all with comments:
 [/list]
 
 [size=4][b]Reporting problems[/b][/size]
-Post in the Bugs tab or on [url=GITHUB_URL/issues]GitHub[/url], and include:
+Post in the Bugs tab or on [url=https://github.com/rfadeew/nrftw-egpu-fix/issues]GitHub[/url], and include:
 [list]
 [*][b]egpu_proxy.log[/b] from the game folder (previous run: egpu_proxy.prev.log). It contains no user names or folder paths.
 [*]Your GPU, enclosure, link (TB3/TB4/TB5/USB4/OCuLink), CPU, driver version and graphics settings.
@@ -184,7 +184,7 @@ Post in the Bugs tab or on [url=GITHUB_URL/issues]GitHub[/url], and include:
 [/list]
 
 [size=4][b]Source code[/b][/size]
-Open source (MIT): [url=GITHUB_URL]GITHUB_URL[/url]
+Open source (MIT): [url=https://github.com/rfadeew/nrftw-egpu-fix]https://github.com/rfadeew/nrftw-egpu-fix[/url]
 
 [size=4][b]Credits[/b][/size]
 [list]

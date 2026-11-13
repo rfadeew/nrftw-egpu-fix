@@ -1,5 +1,5 @@
 <!-- Tag: v0.1.0-beta | Title: v0.1.0-beta: first public beta | Mark as pre-release -->
-<!-- Attach: dist/No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip. Replace SHA256_ZIP / SHA256_DLL with the output of package.bat. -->
+<!-- Attach: dist/No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip. SHA-256 below match this zip; rerun package.bat and update them if the code changes. -->
 
 **Public beta for NVIDIA eGPUs without Resizable BAR** (Thunderbolt / USB4). It has been tested on one system
 only. Please read the limitations below and report your results.
@@ -70,8 +70,8 @@ that log.
 ## Checksums (SHA-256)
 
 ```
-SHA256_ZIP  No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip
-SHA256_DLL  version.dll
+09def442d91163248e2cd888f0880947b103c987f3fef4f3441475458cf0e4aa  No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip
+44774573fa37455108efd21caf7cc72513a529e33b0a6d3a752376bb2d9064b6  version.dll
 ```
 
 MIT License. Uses [MinHook](https://github.com/TsudaKageyu/minhook) (BSD 2-clause). Not affiliated with Moon

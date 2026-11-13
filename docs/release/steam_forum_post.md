@@ -1,6 +1,6 @@
 # Steam community forum post (No Rest for the Wicked → General Discussions)
 
-Steam markup. Replace `GITHUB_URL` and `NEXUS_URL` before you post.
+Steam markup. Replace `NEXUS_URL` before you post (or use the GitHub Releases link).
 
 ## Title
 
@@ -49,7 +49,7 @@ i7-12700H laptop with a TB4 port, RTX 5070 Ti eGPU (no ReBAR), driver 617.42, Wi
 Please reply here or open an issue on GitHub. Attach egpu_proxy.log from the game folder (it contains no user names or paths) and say which GPU, enclosure, link and CPU you have. For performance issues, set Measure=1 in egpu_fix.ini first.
 
 Download (Nexus): NEXUS_URL
-Source code and details (GitHub, MIT): GITHUB_URL
+Source code and details (GitHub, MIT): https://github.com/rfadeew/nrftw-egpu-fix
 
 Not affiliated with Moon Studios. Moon, if you read this: a short technical write-up of the cause is on the GitHub page.
 ```

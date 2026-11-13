@@ -42,7 +42,7 @@ KNOWN LIMITATIONS
     to Moon Studios.
 
 Full README, source code and issue tracker:
-  GITHUB_URL
+  https://github.com/rfadeew/nrftw-egpu-fix
 
 MIT License (see LICENSE). Uses MinHook (BSD 2-clause), see THIRD_PARTY_NOTICES.md.
 Not affiliated with Moon Studios, Private Division or NVIDIA.

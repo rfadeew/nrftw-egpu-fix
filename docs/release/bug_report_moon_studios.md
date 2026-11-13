@@ -83,5 +83,5 @@ engine.
    (about 10,000 per 5 s). This also removes CPU overhead on every system.
 
 Logs with the full per-frame statistics, and PIX timing/GPU captures, are available on request. I have published the
-test DLL as an open-source workaround for other eGPU users (GITHUB_URL). It is not meant to replace a fix in the
+test DLL as an open-source workaround for other eGPU users (https://github.com/rfadeew/nrftw-egpu-fix). It is not meant to replace a fix in the
 game.
