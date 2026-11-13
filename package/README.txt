@@ -1,4 +1,4 @@
-No Rest for the Wicked eGPU Fix - v0.1.0
+No Rest for the Wicked eGPU Fix - v0.2.0
 ========================================
 
 Speeds up No Rest for the Wicked on NVIDIA eGPUs without Resizable BAR
@@ -11,7 +11,7 @@ INSTALL
   2. Copy version.dll and egpu_fix.ini into that folder.
   3. Start the game normally.
   Check: egpu_proxy.log in the game folder should contain
-  "vidmem: stage 2c ON" and "-> VRAM" lines.
+  "shadow: stage 2e ON" and "shadow: UPLOAD heap" lines.
   MelonLoader users: MelonLoader also uses version.dll. Do not overwrite
   it; rename MelonLoader's version.dll to winhttp.dll first (untested).
 
@@ -19,7 +19,9 @@ UNINSTALL
   Delete version.dll and egpu_fix.ini (and egpu_proxy*.log) from the game folder.
 
 SETTINGS
-  See the comments in egpu_fix.ini. VidmemHeaps=0 turns the fix off.
+  See the comments in egpu_fix.ini. ShadowHeaps=1 is the main fix (default).
+  VidmemHeaps=1 is the fallback (the v0.1.0 fix). ShadowHeaps=0 gives the
+  v0.1.0 behaviour; both 0 turns the fix off.
 
 REPORTING PROBLEMS
   Attach egpu_proxy.log (the previous run is egpu_proxy.prev.log) and your GPU,
@@ -30,11 +32,15 @@ REPORTING PROBLEMS
 KNOWN LIMITATIONS
   - Tested on one system so far (i7-12700H laptop, TB4, RTX 5070 Ti eGPU,
     driver 617.42, Windows 11 25H2).
-  - CPU writes to the moved buffers are slower; heavy scenes can become
-    CPU-limited instead of GPU-limited.
-  - Only 160-192 MB of the 256 MB VRAM window is usable. When it is full
-    (a "SYSMEM" line in the log), further heaps stay in normal system memory,
-    as without the fix: correct, just not faster. No action needed.
+  - System RAM use rises by about 300-350 MB (copies of the game's upload
+    heaps); they are not freed while the game runs.
+  - Changed data is copied to VRAM over Thunderbolt every frame; at the
+    heaviest spot this copy bandwidth limits the frame rate.
+  - Known risk: the copy target overlaps the game's buffers in the same VRAM
+    heap (see docs/how-it-works.md). No problem observed so far.
+  - Fallback (VidmemHeaps) only: CPU writes are slower, and only 160-192 MB of
+    the 256 MB VRAM window is usable. When it is full (a "SYSMEM" line in the
+    log), further heaps stay in normal system memory: correct, just not faster.
   - Tested in one 1-hour session; longer sessions and online co-op are not
     tested yet. Use online at your own risk; the game has no anti-cheat as of
     Steam build 22928553.

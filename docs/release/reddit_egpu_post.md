@@ -5,15 +5,16 @@ Markdown mode. Replace `NEXUS_URL` (or use the GitHub Releases link). Check the 
 
 ## Title
 
-No Rest for the Wicked: 13.7 → 42 FPS on a TB4 eGPU without ReBAR by moving UPLOAD heaps into BAR1 (NVAPI, open source)
+No Rest for the Wicked: about 12 → 40–46 FPS on a TB4 eGPU without ReBAR by moving UPLOAD heaps into VRAM with a write-watched shadow (open source, v0.2.0)
 
 ## Body
 
 TL;DR: *No Rest for the Wicked* reads its per-frame vertex, constant and SRV data straight from D3D12 `UPLOAD`
 heaps in system memory. Over Thunderbolt without ReBAR, that makes the GPU stall most of the frame. I wrote a
-`version.dll` proxy that creates those heaps in the 256 MB CPU-visible VRAM window (BAR1) through
-`NvAPI_D3D12_CreateHeap2` + `NV_D3D12_HEAP_FLAG_CPUVISIBLE_VIDMEM`. Worst spot: 13.7 → 42 FPS. NVIDIA only;
-looking for testers with other setups.
+`version.dll` proxy that creates those heaps in VRAM and keeps a write-watched system-memory copy for the CPU;
+only the changed pages are copied to VRAM each frame. Heaviest spot: about 12 → 40–46 FPS. NVIDIA only; looking
+for testers with other setups. v0.1.0 put the heaps in the 256 MB BAR1 window instead (31–34 FPS, but 16–26 once
+the window filled up in long sessions); v0.2.0 does not depend on that window.
 
 **Setup**
 
@@ -31,17 +32,22 @@ looking for testers with other setups.
   mostly waiting on those reads. The 5070 Ti eGPU was slower there than the laptop's internal 3060, which has
   ReBAR.
 
-**The fix**
+**The fix (v0.2.0, "stage 2e")**
 
-- The proxy hooks `CreateHeap`/`CreateHeap1`. For `UPLOAD` heaps it calls `NvAPI_D3D12_CreateHeap2` with the
-  CPU-visible-vidmem flag instead. The game gets a normal heap; the data just lives in VRAM.
-- CPU writes now go through BAR1 at about 0.8 GB/s (vs about 16 GB/s to sysmem). That is fine here because the
-  GPU-side win is much bigger.
+- The proxy hooks `CreateHeap`/`CreateHeap1`. A game `UPLOAD` heap becomes a `DEFAULT` heap in VRAM.
+- `Map` of a buffer in it returns a system-memory "shadow" (`VirtualAlloc` with `MEM_WRITE_WATCH`, wrapped as a
+  D3D12 heap with `OpenExistingHeapFromAddress`). The game's CPU writes stay fast, ordinary cached writes.
+- At each game `ExecuteCommandLists` the pages the CPU wrote (`GetWriteWatch`) are copied shadow → VRAM on the
+  proxy's own COPY queue, and the game's queue waits on a fence for it. Every GPU read is a VRAM read; only
+  changed data crosses Thunderbolt (about 21 MB per frame at the heaviest spot).
+- Fallback for heaps it cannot take: the v0.1.0 method (NVAPI heaps in the BAR1 window), then a normal heap.
 
-| | Off | On |
-|---|---|---|
-| Worst spot | 13.7 FPS, GPU busy 73 ms | 42 FPS, GPU busy 7 ms |
-| Lighter spot | 29 FPS | 50–59 FPS (60 cap) |
+| | No fix | v0.1.0 (BAR1) | v0.2.0 (shadow) |
+|---|---|---|---|
+| Heaviest spot | about 11–13 FPS | 31–34 FPS (16–26 once BAR1 is full) | about 40–46 FPS |
+
+Per frame with v0.2.0: about 12 ms of GPU work plus about 7.6 ms of the GPU waiting for the copy over TB4
+(copy-bandwidth bound, about 2.2–2.8 GB/s).
 
 **Things eGPU people might find interesting**
 
@@ -52,14 +58,18 @@ looking for testers with other setups.
   normal one, and stops trying.
 - `NvAPI_D3D12_QueryCpuVisibleVidmem` returns `NVAPI_NOT_SUPPORTED` on this setup, so the window size is not
   available from the driver.
-- With the fix on, the worst spot becomes CPU-limited: the game's job threads write per-frame data straight into
-  BAR1 at TB speed (about 3 → 14 ms CPU per worker per frame).
+- With the v0.1.0 method, the worst spot became CPU-limited: the game's job threads wrote per-frame data straight
+  into BAR1 at TB speed (about 3 → 14 ms CPU per worker per frame). The shadow copy avoids that: the CPU writes to
+  normal system memory.
+- Costs of v0.2.0: about 300–350 MB more system RAM (shadow heaps are not freed while the game runs), and a known
+  aliasing risk: the copy target is one buffer placed over the whole VRAM heap, so it overlaps the game's buffers
+  and is written on another queue (aliasing barrier only). Not seen to cause problems so far.
 - The same pattern (shaders reading `UPLOAD` heaps directly) probably hurts other D3D12 games on eGPUs. The
   approach could be generalised, but this release only targets this game.
 
 **Limitations**
 
-- Tested on one system so far. NVIDIA only. With ReBAR, or on AMD/Intel, it switches itself off.
+- Tested on one system so far. NVIDIA only. `ShadowHeaps=0` in the ini gives the v0.1.0 behaviour. With ReBAR, or on AMD/Intel, it switches itself off.
 - Tested in one 1-hour session; longer sessions and online co-op are not tested yet. The game has no anti-cheat, and the mod does not touch game
   logic or the network. Still, use it online at your own risk.
 - To uninstall, delete `version.dll` and `egpu_fix.ini` from the game folder.

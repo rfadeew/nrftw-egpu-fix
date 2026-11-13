@@ -9,7 +9,7 @@ No Rest for the Wicked eGPU Fix
 
 ## Version
 
-0.1.0
+0.2.0
 
 ## Category
 
@@ -18,12 +18,12 @@ Performance? Use "Miscellaneous" if the game has no Performance category.
 ## Brief overview (short summary, max ~350 characters)
 
 Up to 3x FPS on NVIDIA eGPUs without Resizable BAR (Thunderbolt/USB4). A version.dll proxy that moves the game's
-per-frame upload heaps into the GPU's CPU-visible VRAM window through NVAPI. Tested on one system so far.
+per-frame upload heaps into VRAM and copies only the changed data over the link. Tested on one system so far.
 Switches itself off on ReBAR, AMD and Intel GPUs.
 
 ## File to upload
 
-`No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0.zip` (from `dist\`). Main file, version 0.1.0.
+`No-Rest-for-the-Wicked-eGPU-Fix-v0.2.0.zip` (from `dist\`). Main file, version 0.2.0.
 File description: "Copy version.dll and egpu_fix.ini into the game folder."
 
 ## Tags and checkboxes to review
@@ -44,16 +44,17 @@ below can be used instead.
 ```
 Makes No Rest for the Wicked much faster on NVIDIA eGPUs without Resizable BAR (Thunderbolt / USB4 enclosures).
 
-Over Thunderbolt without ReBAR the GPU waits for most of every frame: the game makes it read per-frame vertex and shader data directly from system memory, across the slow link. This mod is a small version.dll proxy. It asks the NVIDIA driver (NVAPI) to put that data into the part of VRAM the CPU can reach even without ReBAR, so the GPU reads it locally. Game files are not modified.
+Over Thunderbolt without ReBAR the GPU waits for most of every frame: the game makes it read per-frame vertex and shader data directly from system memory, across the slow link. This mod is a small version.dll proxy. It puts that data in VRAM and keeps a copy in system memory for the game to write to. Only the changed pages are copied to VRAM before the GPU uses them, so the GPU reads everything locally. Game files are not modified.
 
 Results on the test system (i7-12700H laptop, Thunderbolt 4, RTX 5070 Ti eGPU without ReBAR, driver 617.42, Windows 11 25H2), same session, same spots:
-- Worst spot: 13.7 FPS -> 42 FPS (GPU busy time per frame 73 ms -> 7 ms)
-- Lighter spot: 29 FPS -> 50-59 FPS (60 FPS cap)
-Measured with the mod's own GPU timing. Your results will differ.
+- Heaviest spot: about 11-13 FPS -> about 40-46 FPS (version 0.1.0 gave 31-34 FPS, and 16-26 FPS once its VRAM window filled up in a long session)
+Your results will differ.
 
 Tested on one system so far, including a 1-hour play session. Known limitations:
-- CPU writes into the VRAM window are slow, so heavy scenes can become CPU-limited instead of GPU-limited.
-- Only 160-192 MB of the 256 MB window is usable. Data that does not fit stays in system memory, as without the mod.
+- System RAM use rises by about 300-350 MB.
+- At the heaviest spot the frame rate is limited by the copy bandwidth over Thunderbolt.
+- Known technical risk: the copy target overlaps the game's own buffers in VRAM (written on another GPU queue). No problems seen so far.
+- Heaps the main fix cannot take use the version 0.1.0 method (CPU-visible VRAM window), then normal memory. ShadowHeaps=0 in egpu_fix.ini gives the 0.1.0 behaviour.
 - Online co-op and sessions longer than an hour are not tested yet. The game has no anti-cheat (Steam build 22928553), and the mod does not touch game logic, saves or network traffic. Still, use it online at your own risk.
 - If the game crashes, remove the mod and retry before reporting the crash to Moon Studios.
 
@@ -68,7 +69,7 @@ Source code (MIT) and technical details: https://github.com/rfadeew/nrftw-egpu-f
 1. Open the game folder: in Steam, right-click the game -> Manage -> Browse local files (the folder with NoRestForTheWicked.exe).
 2. Copy version.dll and egpu_fix.ini from the archive into that folder.
 3. Start the game normally. No launcher or loader is needed.
-4. Optional check: egpu_proxy.log appears in the game folder and contains "vidmem: stage 2c ON" and "-> VRAM" lines.
+4. Optional check: egpu_proxy.log appears in the game folder and contains "shadow: stage 2e ON" and "shadow: UPLOAD heap" lines.
 
 Using MelonLoader? It also installs a version.dll. Do not overwrite it: rename MelonLoader's version.dll to winhttp.dll first (MelonLoader supports that name), then copy this mod's files. This combination is not tested yet.
 
@@ -79,12 +80,12 @@ Update: overwrite both files with the new version.
 ### Main features
 
 ```
-- Moves the game's per-frame upload heaps into the GPU's CPU-visible VRAM window (BAR1) through NVIDIA's NVAPI. On the test system: worst spot 13.7 -> 42 FPS.
+- Moves the game's per-frame upload heaps into VRAM, with a write-watched system-memory copy and a per-frame copy of only the changed pages. On the test system: heaviest spot about 12 -> 40-46 FPS.
 - Turns itself off on GPUs with Resizable BAR, on AMD and Intel GPUs, and when NVAPI is missing. The DLL then only passes calls through.
-- Notices when the VRAM window is full and leaves the remaining heaps exactly as the game made them.
+- Falls back to the older CPU-visible VRAM window method (v0.1.0), then to the game's normal heaps, for heaps it cannot take.
 - Does not change game files, shaders, saves or network traffic. The rendered image is the same.
 - Writes egpu_proxy.log with FPS and fix status. Measure=1 adds detailed GPU timing for bug reports. The log contains no user names or folder paths.
-- Four settings in a commented egpu_fix.ini. To uninstall, delete two files.
+- Five settings in a commented egpu_fix.ini. To uninstall, delete two files.
 - Open source (MIT).
 ```
 
@@ -120,7 +121,7 @@ Performance fix for [b]NVIDIA eGPUs without Resizable BAR[/b] (Thunderbolt / USB
 [size=4][b]What it does[/b][/size]
 No Rest for the Wicked reads its per-frame vertex, shader-resource and constant data from D3D12 "upload" heaps in system memory. Over Thunderbolt without ReBAR every one of those GPU reads crosses a slow link, and the GPU spends most of the frame waiting. On the test system an RTX 5070 Ti eGPU was slower than the laptop's internal RTX 3060.
 
-This mod is a small [b]version.dll[/b] proxy. It creates those heaps in the GPU's CPU-visible VRAM window (BAR1, 256 MB, available even without ReBAR) through NVIDIA's NVAPI. The GPU then reads that data from its own VRAM. Game files, shaders and rendering are unchanged.
+This mod is a small [b]version.dll[/b] proxy. It creates those heaps in VRAM and keeps a copy in system memory (a "shadow") for the game's CPU writes. Before each frame's GPU work, only the pages the CPU changed are copied from the shadow to VRAM on the mod's own copy queue. The GPU then reads that data from its own VRAM. Game files, shaders and rendering are unchanged. Version 0.1.0 used the 256 MB CPU-visible VRAM window (BAR1) through NVAPI instead; that method is still the fallback.
 
 [size=4][b]Results (test system)[/b][/size]
 [list]
@@ -128,10 +129,10 @@ This mod is a small [b]version.dll[/b] proxy. It creates those heaps in the GPU'
 [*]NVIDIA driver 617.42, Windows 11 25H2, game Steam build 22928553.
 [/list]
 [list]
-[*]Worst spot: [b]13.7 FPS -> 42 FPS[/b]. GPU busy time per frame dropped from 73 ms to 7 ms.
-[*]Lighter spot: [b]29 FPS -> 50-59 FPS[/b] (60 FPS cap).
+[*]Heaviest spot: [b]about 11-13 FPS -> about 40-46 FPS[/b]. Version 0.1.0 gave 31-34 FPS there, and 16-26 FPS once its VRAM window filled up in a long session.
+[*]Per frame at that spot: about 12 ms of GPU work plus about 7.6 ms of the GPU waiting for the copy over Thunderbolt.
 [/list]
-Measured in the same session at the same spots, with the mod's own logging (GPU timestamps). Your results will differ. Full measurements and technical details: [url=https://github.com/rfadeew/nrftw-egpu-fix/blob/main/docs/how-it-works.md]How it works[/url].
+Measured in the same session at the same spot, with the mod's own logging. Your results will differ. Full measurements and technical details: [url=https://github.com/rfadeew/nrftw-egpu-fix/blob/main/docs/how-it-works.md]How it works[/url].
 
 [size=4][b]Who should use it[/b][/size]
 [list]
@@ -148,7 +149,7 @@ To check ReBAR: NVIDIA Control Panel -> System Information -> Resizable BAR.
 [*]Copy [b]version.dll[/b] and [b]egpu_fix.ini[/b] from the archive into that folder.
 [*]Start the game normally.
 [/list]
-To check that it works, open [b]egpu_proxy.log[/b] in the game folder. It should contain "vidmem: stage 2c ON" and "-> VRAM" lines.
+To check that it works, open [b]egpu_proxy.log[/b] in the game folder. It should contain "shadow: stage 2e ON" and "shadow: UPLOAD heap" lines.
 
 [b]Using MelonLoader?[/b] It also installs a version.dll. Do not overwrite it: rename MelonLoader's version.dll to winhttp.dll first (MelonLoader supports that name), then copy this mod's files. This combination is not tested yet.
 
@@ -156,20 +157,22 @@ To check that it works, open [b]egpu_proxy.log[/b] in the game folder. It should
 Delete [b]version.dll[/b] and [b]egpu_fix.ini[/b] (and egpu_proxy*.log) from the game folder.
 
 [size=4][b]Settings[/b][/size]
-egpu_fix.ini has four settings, all with comments:
+egpu_fix.ini has five settings, all with comments:
 [list]
-[*]VidmemHeaps: 1 = the fix (default), 0 = off.
-[*]VidmemCapMB: upper limit for the mod's use of the VRAM window (default 192). The mod also stops by itself when the window is full.
+[*]ShadowHeaps: 1 = the main fix (default), 0 = off. ShadowHeaps=0 gives the version 0.1.0 behaviour.
+[*]VidmemHeaps: 1 = fallback (the version 0.1.0 method, default), 0 = off. Both 0: the DLL only logs FPS.
+[*]VidmemCapMB: upper limit for the fallback's use of the VRAM window (default 192). The fallback also stops by itself when the window is full.
 [*]Measure: 1 = detailed logging for bug reports. Costs FPS; set it back to 0 afterwards.
 [*]IntervalSec: seconds between the stats lines in the log.
 [/list]
 
 [size=4][b]Known issues and limitations[/b][/size]
 [list]
-[*][b]CPU writes into the VRAM window are slow[/b] (about 0.8 GB/s over TB4 vs about 16 GB/s to system memory). Heavy scenes can become CPU-limited instead of GPU-limited. A slower CPU may gain less.
-[*][b]Only 160-192 MB of the 256 MB window is usable[/b] (160 MB in a game session on the test system). When it is full, the driver silently uses system memory. The mod detects this, writes a "SYSMEM" line to the log and uses normal heaps from then on, exactly as without the mod. That is normal; rendering stays correct, only those heaps miss the speed-up.
-[*][b]CPU reads from the window are extremely slow.[/b] The game was not seen reading these buffers. If it ever did, it would stall.
-[*][b]Sessions longer than about an hour are not tested yet.[/b] The game's heap pool only grows (32 -> 224 MB in one hour).
+[*][b]More system RAM:[/b] about 300-350 MB (copies of the game's upload heaps). They are not freed while the game runs.
+[*][b]Copy bandwidth:[/b] changed data (about 21 MB per frame at the heaviest spot) crosses Thunderbolt every frame, and that limits the frame rate there.
+[*][b]Known technical risk:[/b] the copy target is one buffer placed over a whole VRAM heap, so it overlaps the game's own buffers. It is written on the mod's copy queue while the game may read other parts of the heap on another queue. No problems seen so far.
+[*][b]Fallback only (the 0.1.0 method):[/b] CPU writes into the VRAM window are slow, CPU reads are extremely slow, and only 160-192 MB of the 256 MB window is usable. When it is full, the mod writes a "SYSMEM" line to the log and uses normal heaps, exactly as without the mod. That is normal.
+[*][b]Sessions longer than about an hour are not tested yet.[/b] The game's heap pool only grows.
 [*][b]Online co-op has not been tested with the mod.[/b] The game ships no anti-cheat (as of Steam build 22928553), and the mod does not touch game logic, saves or network traffic. Still, use it online at your own risk. If the game adds anti-cheat later, remove the mod.
 [*]If the game crashes, remove the mod and retry before reporting the crash to Moon Studios.
 [*]Game updates may change how the game uses GPU memory. The mod could then stop helping, or stop being needed.

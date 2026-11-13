@@ -35,13 +35,14 @@ struct Config {
     bool hybridCopyQueue  = false; // [Fix] HybridCopyQueue: copies on our own COPY queue, overlapping the game's rendering
     bool hybridCheck      = false; // [Fix] HybridCheck: hash mirrored buffers, count/repair stale mirror data (Measure=1 only)
     bool hybridNoCopy     = false; // [Fix] HybridTestNoCopy: redirect but never copy (negative test, must break rendering)
-    bool shadowHeaps      = false; // [Fix] ShadowHeaps: UPLOAD heaps live in VRAM, CPU writes go to a sysmem shadow (stage 2e)
+    bool shadowHeaps      = true;  // [Fix] ShadowHeaps: UPLOAD heaps live in VRAM, CPU writes go to a sysmem shadow (stage 2e)
     int  shadowMergeKB    = 16;    // [Fix] ShadowMergeKB: dirty ranges closer than this are merged into one copy
     int  shadowStreamUs   = 0;     // [Fix] ShadowStreamUs: background flush period in us (0 = off, else 200..20000)
     int  shadowStreamMinKB = 64;   // [Fix] ShadowStreamMinKB: a background round copies only if at least this much is dirty
     bool shadowStreamAll  = false; // [Fix] ShadowStreamAllHeaps: background rounds scan every heap, not only the hot ones
     int  shadowStreamMaxInFlight = 2; // [Fix] ShadowStreamMaxInFlight: background rounds skipped while this many copies are pending
     bool shadowNoCopy     = false; // [Fix] ShadowTestNoCopy: never copy shadow -> VRAM (negative test, must break rendering)
+    bool shadowTestFail   = false; // [Fix] ShadowTestFail: every shadow heap fails at its last step (tests the 2c fallback)
 };
 extern Config g_cfg;
 

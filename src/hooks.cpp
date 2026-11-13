@@ -1938,6 +1938,7 @@ static bool TryShadowHeap(ID3D12Device* d, const D3D12_HEAP_DESC* hd, REFIID rii
                     " the Map hook is not active, stage 2e heaps are NOT used", mh, mp, (void*)h->shadow);
         }
     }
+    if (SUCCEEDED(hr) && g_cfg.shadowTestFail) { step = "TEST: ShadowTestFail=1"; hr = E_FAIL; } // fallback test
     if (SUCCEEDED(hr)) { step = "QueryInterface(heap)"; hr = h->vheap->QueryInterface(riid, ppv); }
     if (FAILED(hr)) {
         g_shFailed.fetch_add(1, std::memory_order_relaxed);
@@ -3547,10 +3548,15 @@ template <int V> struct ListHooks {
 // ============================================================================
 static std::atomic<int64_t> g_lastPresentQpc{0};
 static std::atomic<uint64_t> g_ftSumUs{0}, g_ftCount{0}, g_ftMaxUs{0}, g_ftOver33{0}, g_ftOver50{0};
+static std::atomic<uint32_t> g_presentSyncLast{0}, g_presentFlagsLast{0};
+static std::atomic<uint64_t> g_presentSyncFrames{0}; // frames presented with SyncInterval > 0 (since last stats)
 
-static void OnPresent(UINT flags)
+static void OnPresent(UINT sync, UINT flags)
 {
     if (flags & DXGI_PRESENT_TEST) return;
+    g_presentSyncLast.store(sync, std::memory_order_relaxed);
+    g_presentFlagsLast.store(flags, std::memory_order_relaxed);
+    if (sync) g_presentSyncFrames.fetch_add(1, std::memory_order_relaxed);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     const int64_t prev = g_lastPresentQpc.exchange(now.QuadPart);
     if (prev) {
@@ -3573,7 +3579,7 @@ static PFN_Present1 o_Present1;
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     const bool outer = t_presentDepth++ == 0;
-    if (outer) OnPresent(flags);
+    if (outer) OnPresent(sync, flags);
     const int64_t t0 = Qpc();
     HRESULT hr = o_Present(sc, sync, flags);
     if (outer) AddTime(g_apiTime[AT_PRESENT], Qpc() - t0);
@@ -3583,7 +3589,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT sync, UIN
 static HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
 {
     const bool outer = t_presentDepth++ == 0;
-    if (outer) OnPresent(flags);
+    if (outer) OnPresent(sync, flags);
     const int64_t t0 = Qpc();
     HRESULT hr = o_Present1(sc, sync, flags, pp);
     if (outer) AddTime(g_apiTime[AT_PRESENT], Qpc() - t0);
@@ -3870,12 +3876,15 @@ static void DumpStats(StatsState& st)
 
     const uint64_t ftSum = g_ftSumUs.exchange(0), ftCnt = g_ftCount.exchange(0), ftMax = g_ftMaxUs.exchange(0);
     const uint64_t o33 = g_ftOver33.exchange(0), o50 = g_ftOver50.exchange(0);
+    const uint64_t syncFrames = g_presentSyncFrames.exchange(0);
 
     std::string s;
     SYSTEMTIME t; GetLocalTime(&t);
-    Appendf(s, "[%02d:%02d:%02d.%03d] ==== stats %.1fs | frames %llu | %.1f fps | frametime avg %.2f ms, max %.2f ms, >33ms %llu, >50ms %llu ====\n",
+    Appendf(s, "[%02d:%02d:%02d.%03d] ==== stats %.1fs | frames %llu | %.1f fps | frametime avg %.2f ms, max %.2f ms, >33ms %llu, >50ms %llu"
+               " | present sync %u flags 0x%x, frames with sync>0 %llu ====\n",
             t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, dt, df, df / (dt > 0 ? dt : 1.0),
-            ftCnt ? ftSum / 1000.0 / ftCnt : 0.0, ftMax / 1000.0, o33, o50);
+            ftCnt ? ftSum / 1000.0 / ftCnt : 0.0, ftMax / 1000.0, o33, o50,
+            g_presentSyncLast.load(), g_presentFlagsLast.load(), syncFrames);
     if (!g_cfg.measure) { // fix-only mode: FPS, stage 2c state, CPU per thread
         if (!g_vidOn.load())
             Appendf(s, "  fix Vidmem: OFF (%s)\n", g_vidOffReason);

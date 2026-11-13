@@ -4,7 +4,7 @@ Steam markup. Replace `NEXUS_URL` before you post (or use the GitHub Releases li
 
 ## Title
 
-[Mod] eGPU without ReBAR: 13.7 → 42 FPS with a small fix (NVIDIA, Thunderbolt)
+[Mod] eGPU without ReBAR: about 12 → 40-46 FPS with a small fix (NVIDIA, Thunderbolt) - v0.2.0
 
 ## Body
 
@@ -15,13 +15,12 @@ If you play on an NVIDIA eGPU over Thunderbolt / USB4, you may have noticed that
 The game reads a lot of per-frame data (vertices, shader data, constants) directly from system memory. In a desktop PC that is fast. Over Thunderbolt without Resizable BAR every one of those GPU reads crosses a slow, high-latency link, and the GPU spends most of the frame waiting.
 
 [h2]The fix[/h2]
-A version.dll proxy that you drop into the game folder. It asks the NVIDIA driver (through NVAPI) to put those buffers into the small part of VRAM the CPU can see even without ReBAR. The GPU then reads them from its own VRAM. Game files are not modified. To uninstall, delete the two files.
+A version.dll proxy that you drop into the game folder. It puts those buffers in VRAM and keeps a copy in system memory for the game to write to. Only the changed data is copied to VRAM before the GPU needs it, so the GPU reads everything from its own VRAM. Version 0.2.0 no longer depends on the small CPU-visible VRAM window that version 0.1.0 used, so it keeps working in long sessions. Game files are not modified. To uninstall, delete the two files.
 
 [h2]Results on my system[/h2]
 i7-12700H laptop with a TB4 port, RTX 5070 Ti eGPU (no ReBAR), driver 617.42, Windows 11 25H2:
 [list]
-[*]Worst spot: [b]13.7 → 42 FPS[/b] (GPU busy per frame 73 ms → 7 ms)
-[*]Lighter spot: [b]29 → 50-59 FPS[/b] (60 FPS cap)
+[*]Heaviest spot: [b]about 11-13 → 40-46 FPS[/b] (v0.1.0: 31-34 FPS, and 16-26 FPS once its VRAM window filled up in a long session)
 [/list]
 
 [h2]Who it is for[/h2]
@@ -39,8 +38,10 @@ i7-12700H laptop with a TB4 port, RTX 5070 Ti eGPU (no ReBAR), driver 617.42, Wi
 
 [h2]Known limitations[/h2]
 [list]
-[*]CPU writes into that VRAM window are slow, so heavy scenes can become CPU-limited instead of GPU-limited.
-[*]Only 160-192 MB of the window is usable. When it is full, the mod notices ("SYSMEM" line in the log) and leaves further buffers in normal system memory, as without the mod. Correct, just not faster for those.
+[*]It uses about 300-350 MB more system RAM.
+[*]At the heaviest spot the frame rate is limited by how fast changed data can be copied over Thunderbolt.
+[*]There is a known technical risk (the copy target overlaps the game's own buffers in VRAM). No problems seen so far.
+[*]If something looks wrong, set ShadowHeaps=0 in egpu_fix.ini to get the older v0.1.0 behaviour, and tell me whether it changes anything.
 [*]Tested in one 1-hour session; longer sessions and online co-op are not tested yet. The game has no anti-cheat (as of the current Steam build), and the mod does not touch game logic or network traffic. Still, use it online at your own risk.
 [*]If the game crashes, please remove the mod and retry before reporting the crash to Moon Studios.
 [/list]

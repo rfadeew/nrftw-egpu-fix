@@ -24,7 +24,62 @@ The usual fix for this pattern is Resizable BAR plus `D3D12_HEAP_TYPE_GPU_UPLOAD
 application put CPU-written data directly into VRAM. Most Thunderbolt setups have no ReBAR. The game does not
 use `GPU_UPLOAD` either.
 
-## The fix
+## The fix: stage 2e, ShadowHeaps (default since v0.2.0)
+
+v0.1.0 put the heaps in the 256 MB BAR1 window (stage 2c, below). That window is small and fills up as the
+game's upload heap pool grows past about 350 MB in long sessions. Heaps created after that stay in system memory,
+and the heaviest spot fell to 16-26 FPS. Stage 2e does not use the window.
+
+How it works:
+
+- The proxy hooks `CreateHeap`/`CreateHeap1`. A game `UPLOAD` heap is created as a `DEFAULT` heap in VRAM.
+- `Map` of a buffer placed in such a heap returns a system-memory "shadow" instead. The shadow is allocated with
+  `VirtualAlloc(MEM_WRITE_WATCH)` and wrapped as a D3D12 heap with `ID3D12Device3::OpenExistingHeapFromAddress`.
+  The game writes into ordinary cached system memory (fast CPU writes, no BAR1 involved).
+- At each game `ExecuteCommandLists`, the proxy asks `GetWriteWatch` which shadow pages the CPU wrote since the
+  last time, and copies those pages shadow -> VRAM on its own COPY queue. The game's queue waits on a fence for
+  that copy before it runs the game's command lists.
+- Every GPU read of that data is now a VRAM read. Only changed data crosses Thunderbolt: about 21 MB per frame at
+  the heaviest spot.
+
+Gating is the same as before: an NVIDIA GPU without ReBAR (`GPUUploadHeapSupported=0`), and the device must
+support existing heaps. Otherwise stage 2e switches itself off and logs why (`shadow: stage 2e OFF ...`).
+
+Fallback order for each `UPLOAD` heap: stage 2e, then stage 2c (if `VidmemHeaps=1`), then a normal heap. A heap
+that stage 2e cannot take (for example, a size that is not a multiple of 64 KB, or a failed step; the log says
+which) is created as stage 2c would, and if that is not possible it is created as without the fix.
+
+### Measurements (v0.2.0)
+
+Heaviest spot, same session, test system (RTX 5070 Ti eGPU, TB4, no ReBAR, monitor on the eGPU):
+
+| | FPS |
+|---|---|
+| No fix | about 11-13 |
+| v0.1.0 (stage 2c) | 31-34; 16-26 once the BAR1 window is full |
+| v0.2.0 (stage 2e) | about 40-46, independent of the BAR1 window |
+
+Frame breakdown with v0.2.0 at that spot: about 12 ms of GPU work, plus about 7.6 ms of the GPU waiting for the
+shadow -> VRAM copy over Thunderbolt. The copy runs at about 2.2-2.8 GB/s, so the frame rate is limited by copy
+bandwidth.
+
+### Costs and known risk
+
+- **System RAM:** it rises by the size of the game's upload heaps (about 300-350 MB). Shadow heaps are never
+  freed while the game runs. The game does not release these heaps today; the proxy keeps a heap the game
+  releases, and only scans it from then on.
+- **Aliasing (known risk):** the copy target is one buffer placed over the whole VRAM heap, so it aliases the
+  game's own placed buffers in that heap. It is written on the mod's COPY queue while the game may read other
+  parts of the same heap on another queue. The proxy only issues an aliasing barrier (see `src/hooks.cpp` around
+  line 2065). This has not been observed to cause problems, and the smoke tests pass, but it is not guaranteed by
+  the D3D12 specification.
+- **CPU writes** go to normal cached system memory, so the slow-write cost of stage 2c does not apply to heaps
+  handled by stage 2e.
+
+## Stage 2c: CPU-visible VRAM window (fallback, the v0.1.0 fix)
+
+This stage is still on by default (`VidmemHeaps=1`) as the fallback for heaps stage 2e cannot take. With
+`ShadowHeaps=0` it is the only fix, which gives the v0.1.0 behaviour.
 
 Even without ReBAR, NVIDIA GPUs expose a 256 MB window of VRAM to the CPU (BAR1). Since driver R465, NVAPI can
 place D3D12 heaps in that window:
@@ -54,7 +109,7 @@ straight to the normal path. `VidmemCapMB` (192 by default) is only an upper lim
 `NvAPI_D3D12_QueryCpuVisibleVidmem` returns `NVAPI_NOT_SUPPORTED` on the test system, so the driver cannot tell
 how much is free.
 
-## Measurements
+## Measurements (v0.1.0, stage 2c only)
 
 From `egpu_proxy.log` with `Measure=1` (GPU timestamps around every game command list), same session, same
 spots:
@@ -66,7 +121,7 @@ spots:
 
 With the fix on, the worst spot is CPU-limited: the GPU is idle most of the frame.
 
-## Costs
+## Costs of stage 2c
 
 | Access | System memory | BAR1 window over TB4 |
 |---|---|---|
@@ -102,8 +157,9 @@ With the fix on, the worst spot is CPU-limited: the GPU is idle most of the fram
 ## Code map
 
 - `src/version_proxy.cpp`: `DllMain`, `version.dll` export forwarding, log, ini.
-- `src/hooks.cpp`: hooks and statistics. The fix is in the "Stage 2c" section (`InitVidmem`, `TryVidHeap`,
+- `src/hooks.cpp`: hooks and statistics. The main fix (stage 2e) is in the "shadow" code (COPY queue, write
+  watch, `ExecuteCommandLists` sync). The fallback is in the "Stage 2c" section (`InitVidmem`, `TryVidHeap`,
   `HeapWriteSpeed`, `SpeedVerdict`).
 - `src/vtbl_index.c`: D3D12/DXGI vtable slot indices.
 - `tests/smoke.cpp`: a standalone D3D12 test that loads `build\version.dll` and checks rendering results through
-  readback. Run it with every combination of `Measure` and `VidmemHeaps`, plus the `break` negative test.
+  readback. Run it with every combination of `Measure`, `ShadowHeaps` and `VidmemHeaps`, plus the `break` negative test.

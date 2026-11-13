@@ -12,31 +12,36 @@ $base = Get-Content (Join-Path $PSScriptRoot "egpu_fix.dev.ini")
 
 # name, expected (pass/fail), extra smoke args, ini overrides
 $runs = @(
-    @{ n = "m0_release";      e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 0 } },
-    @{ n = "m0_nofix";        e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 0 } },
-    @{ n = "m0_hyb_vbib";     e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 0 } },
-    @{ n = "m0_hyb_srv";      e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1 } },
-    @{ n = "m0_vid_hyb";      e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 1; HybridSrv = 1 } },
-    @{ n = "m0_hyb_srv_cq";   e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridCopyQueue = 1 } },
-    @{ n = "m0_hyb_srv_gap0"; e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridMergeKB = 0 } },
-    @{ n = "m1_release";      e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 1; HybridHeaps = 0 } },
-    @{ n = "m1_hyb_vbib";     e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 0 } },
-    @{ n = "m1_hyb_srv";      e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1 } },
-    @{ n = "m1_hyb_check";    e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridCheck = 1 } },
-    @{ n = "m1_hyb_check_cq"; e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridCheck = 1; HybridCopyQueue = 1 } },
-    @{ n = "m1_consts";       e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; ConstPages = 1 } },
+    @{ n = "m0_release";      e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 0; ShadowHeaps = 1 }; g = "CreateHeap -> shadow" },
+    @{ n = "m0_shadow_fail";  e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 0; ShadowHeaps = 1; ShadowTestFail = 1 }; g = "CreateHeap -> CPU-visible VRAM" },
+    @{ n = "m1_shadow_fail";  e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 1; HybridHeaps = 0; ShadowHeaps = 1; ShadowTestFail = 1 }; g = "CreateHeap -> CPU-visible VRAM" },
+    @{ n = "m0_vid";          e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 0; ShadowHeaps = 0 } },
+    @{ n = "m0_nofix";        e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 0; ShadowHeaps = 0 } },
+    @{ n = "m0_hyb_vbib";     e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 0; ShadowHeaps = 0 } },
+    @{ n = "m0_hyb_srv";      e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; ShadowHeaps = 0 } },
+    @{ n = "m0_vid_hyb";      e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 1; HybridSrv = 1; ShadowHeaps = 0 } },
+    @{ n = "m0_hyb_srv_cq";   e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridCopyQueue = 1; ShadowHeaps = 0 } },
+    @{ n = "m0_hyb_srv_gap0"; e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridMergeKB = 0; ShadowHeaps = 0 } },
+    @{ n = "m1_release";      e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 1; HybridHeaps = 0; ShadowHeaps = 1 }; g = "CreateHeap -> shadow" },
+    @{ n = "m1_vid";          e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 1; HybridHeaps = 0; ShadowHeaps = 0 } },
+    @{ n = "m1_hyb_vbib";     e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 0; ShadowHeaps = 0 } },
+    @{ n = "m1_hyb_srv";      e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; ShadowHeaps = 0 } },
+    @{ n = "m1_hyb_check";    e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridCheck = 1; ShadowHeaps = 0 } },
+    @{ n = "m1_hyb_check_cq"; e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridCheck = 1; HybridCopyQueue = 1; ShadowHeaps = 0 } },
+    @{ n = "m1_consts";       e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; ConstPages = 1; ShadowHeaps = 0 } },
     @{ n = "m0_shadow";       e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 1; HybridSrv = 1; ShadowHeaps = 1 } },
     @{ n = "m1_shadow";       e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 1; HybridHeaps = 1; HybridSrv = 1; ShadowHeaps = 1 } },
+    @{ n = "m1_shadow_consts"; e = "pass"; a = "";     o = @{ Measure = 1; VidmemHeaps = 1; ShadowHeaps = 1; ConstPages = 1 } },
     @{ n = "m0_shadow_gap0";  e = "pass"; a = "";      o = @{ Measure = 0; ShadowHeaps = 1; ShadowMergeKB = 0 } },
     @{ n = "m0_shadow_stream"; e = "pass"; a = "";     o = @{ Measure = 0; ShadowHeaps = 1; ShadowStreamUs = 500 } },
     @{ n = "m1_shadow_stream"; e = "pass"; a = "";     o = @{ Measure = 1; ShadowHeaps = 1; ShadowStreamUs = 500 } },
-    @{ n = "neg_break";       e = "fail"; a = "break"; o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 0 } },
-    @{ n = "neg_hyb_nocopy";  e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridTestNoCopy = 1 } },
-    @{ n = "neg_srv_1copy";   e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridSrvCopies = 1 } },
+    @{ n = "neg_break";       e = "fail"; a = "break"; o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 0; ShadowHeaps = 0 } },
+    @{ n = "neg_hyb_nocopy";  e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridTestNoCopy = 1; ShadowHeaps = 0 } },
+    @{ n = "neg_srv_1copy";   e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridSrvCopies = 1; ShadowHeaps = 0 } },
     @{ n = "neg_shadow_break"; e = "fail"; a = "break"; o = @{ Measure = 0; ShadowHeaps = 1 } },
     @{ n = "neg_shadow_nocopy"; e = "fail"; a = "";     o = @{ Measure = 0; ShadowHeaps = 1; ShadowTestNoCopy = 1 } },
     @{ n = "neg_shadow_stream_nocopy"; e = "fail"; a = ""; o = @{ Measure = 0; ShadowHeaps = 1; ShadowStreamUs = 500; ShadowTestNoCopy = 1 } },
-    @{ n = "neg_cq_1copy";    e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridSrvCopies = 1; HybridCopyQueue = 1 } }
+    @{ n = "neg_cq_1copy";    e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridSrvCopies = 1; HybridCopyQueue = 1; ShadowHeaps = 0 } }
 )
 
 $Only = @($Only | ForEach-Object { $_ -split "," } | Where-Object { $_ })
@@ -55,6 +60,10 @@ foreach ($r in $runs) {
     Copy-Item (Join-Path $build "egpu_proxy.log") (Join-Path $outDir "$($r.n).log") -Force
     $out | Set-Content (Join-Path $outDir "$($r.n).out.txt")
     $got = if ($code -eq 0) { "pass" } else { "fail" }
+    # Optional: the log must contain this text (e.g. which path the heaps took).
+    if ($r.g -and $got -eq "pass" -and -not (Select-String -Path (Join-Path $outDir "$($r.n).log") -SimpleMatch $r.g -Quiet)) {
+        $got = "fail (log lacks '$($r.g)')"
+    }
     $ok = $got -eq $r.e
     if (-not $ok) { $bad++ }
     $summary = ($out | Where-Object { $_ -match "^phase [1-4]:|SMOKE|DEVICE REMOVED" }) -join " | "

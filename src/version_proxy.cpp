@@ -114,6 +114,7 @@ static void ReadConfig(const wchar_t* ini)
     g_cfg.shadowHeaps      = IniBool(L"Fix", L"ShadowHeaps", d.shadowHeaps, ini);
     g_cfg.shadowMergeKB    = IniInt(L"Fix", L"ShadowMergeKB", d.shadowMergeKB, ini);
     g_cfg.shadowNoCopy     = IniBool(L"Fix", L"ShadowTestNoCopy", d.shadowNoCopy, ini);
+    g_cfg.shadowTestFail   = IniBool(L"Fix", L"ShadowTestFail", d.shadowTestFail, ini);
     g_cfg.shadowStreamUs   = IniInt(L"Fix", L"ShadowStreamUs", d.shadowStreamUs, ini);
     g_cfg.shadowStreamMinKB = IniInt(L"Fix", L"ShadowStreamMinKB", d.shadowStreamMinKB, ini);
     g_cfg.shadowStreamMaxInFlight = IniInt(L"Fix", L"ShadowStreamMaxInFlight", d.shadowStreamMaxInFlight, ini);
@@ -223,7 +224,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
     ReadConfig(iniPath);
     Log("config: Hooks=%d Measure=%d IntervalSec=%d VidmemHeaps=%d VidmemBuffers=%d VidmemBufMaxKB=%d VidmemReserveMB=%d"
         " VidmemCapMB=%d VidmemWithReBAR=%d | HybridHeaps=%d HybridSrv=%d HybridSrvCopies=%d HybridMergeKB=%d"
-        " HybridCopyQueue=%d HybridCheck=%d%s | ShadowHeaps=%d ShadowMergeKB=%d ShadowStreamUs=%d ShadowStreamMinKB=%d ShadowStreamMaxInFlight=%d ShadowStreamAllHeaps=%d%s"
+        " HybridCopyQueue=%d HybridCheck=%d%s | ShadowHeaps=%d ShadowMergeKB=%d ShadowStreamUs=%d ShadowStreamMinKB=%d ShadowStreamMaxInFlight=%d ShadowStreamAllHeaps=%d%s%s"
         " | GpuTiming=%d KmtStats=%d LogCreateLimit=%d TopN=%d ConstPages=%d CbvPad=%d LoadPix=%d (ini %s)",
         g_cfg.hooks, g_cfg.measure, g_cfg.statsIntervalSec, g_cfg.vidmemHeaps, g_cfg.vidmemBuffers, g_cfg.vidmemBufMaxKB,
         g_cfg.vidmemReserveMB, g_cfg.vidmemCapMB, g_cfg.vidmemWithReBAR, g_cfg.hybridHeaps, g_cfg.hybridSrv,
@@ -231,6 +232,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
         g_cfg.hybridNoCopy ? " HybridTestNoCopy=1 (TEST: no copies)" : "",
         g_cfg.shadowHeaps, g_cfg.shadowMergeKB, g_cfg.shadowStreamUs, g_cfg.shadowStreamMinKB,
         g_cfg.shadowStreamMaxInFlight, (int)g_cfg.shadowStreamAll, g_cfg.shadowNoCopy ? " ShadowTestNoCopy=1 (TEST: no copies)" : "",
+        g_cfg.shadowTestFail ? " ShadowTestFail=1 (TEST: shadow heaps fail)" : "",
         g_cfg.gpuTiming, g_cfg.kmtStats, g_cfg.logCreateLimit, g_cfg.topN, g_cfg.constPages, g_cfg.cbvPad, g_cfg.loadPix,
         GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES ? "found" : "missing, defaults");
 

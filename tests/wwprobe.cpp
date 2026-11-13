@@ -211,6 +211,49 @@ int wmain()
             cnt = pages.size();
             GetWriteWatch(WRITE_WATCH_FLAG_RESET, mem, kSz, pages.data(), &cnt, &gran);
             printf("  ReadFile 64 KB into heap: ok %d read %lu -> %llu dirty page(s) (expect 16)\n", okr, n, (unsigned long long)cnt);
+            // Direct I/O (DMA into user pages, no CPU copy) and overlapped reads: does write watch see them?
+            {
+                GetTempFileNameW(tmp, L"wwd", 0, fn);
+                HANDLE wf = CreateFileW(fn, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                std::vector<BYTE> pat(65536);
+                for (size_t i = 0; i < pat.size(); ++i) pat[i] = (BYTE)(i * 37 + 11);
+                WriteFile(wf, pat.data(), (DWORD)pat.size(), &n, nullptr);
+                FlushFileBuffers(wf);
+                CloseHandle(wf);
+                struct M { const char* name; DWORD flags; UINT64 off; };
+                const M ms[] = {
+                    { "NO_BUFFERING, sync", FILE_FLAG_NO_BUFFERING, 0x200000 },
+                    { "OVERLAPPED, buffered", FILE_FLAG_OVERLAPPED, 0x300000 },
+                    { "OVERLAPPED | NO_BUFFERING", FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, 0x400000 },
+                };
+                for (const M& m : ms) {
+                    memset(p + m.off, 0, 65536);
+                    cnt = pages.size();
+                    GetWriteWatch(WRITE_WATCH_FLAG_RESET, mem, kSz, pages.data(), &cnt, &gran);
+                    HANDLE rf = CreateFileW(fn, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, m.flags, nullptr);
+                    BOOL ok = FALSE; DWORD got = 0;
+                    if (rf != INVALID_HANDLE_VALUE) {
+                        if (m.flags & FILE_FLAG_OVERLAPPED) {
+                            OVERLAPPED ov = {};
+                            ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                            ok = ReadFile(rf, p + m.off, 65536, nullptr, &ov);
+                            if (!ok && GetLastError() == ERROR_IO_PENDING) ok = TRUE;
+                            if (ok) ok = GetOverlappedResult(rf, &ov, &got, TRUE);
+                            CloseHandle(ov.hEvent);
+                        } else {
+                            ok = ReadFile(rf, p + m.off, 65536, &got, nullptr);
+                        }
+                        CloseHandle(rf);
+                    }
+                    const bool dataOk = memcmp(p + m.off, pat.data(), 65536) == 0;
+                    cnt = pages.size();
+                    GetWriteWatch(WRITE_WATCH_FLAG_RESET, mem, kSz, pages.data(), &cnt, &gran);
+                    printf("  ReadFile %-26s 64 KB into heap: ok %d read %lu data %s -> %llu dirty page(s) (expect 16)%s\n",
+                           m.name, ok, got, dataOk ? "ok" : "WRONG", (unsigned long long)cnt,
+                           cnt == 16 && ok && dataOk ? "" : "  <<< WRITE WATCH MISSED / READ FAILED");
+                }
+                DeleteFileW(fn);
+            }
             // GetWriteWatch cost: 0 / 1000 / all pages dirty.
             for (UINT64 dirty : { 0ull, 1000ull, kSz / 4096 }) {
                 for (UINT64 i = 0; i < dirty; ++i) p[(i * 4096 * 7) % kSz] = (BYTE)i;
