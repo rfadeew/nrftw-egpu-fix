@@ -1,8 +1,8 @@
-<!-- Tag: v0.1.0-beta | Title: v0.1.0-beta: first public beta | Mark as pre-release -->
+<!-- Tag: v0.1.0-beta (matches the version inside the DLL and the zip name) | Title: No Rest for the Wicked eGPU Fix v0.1.0 | Set as the latest release -->
 <!-- Attach: dist/No-Rest-for-the-Wicked-eGPU-Fix-v0.1.0-beta.zip. SHA-256 below match this zip; rerun package.bat and update them if the code changes. -->
 
-**Public beta for NVIDIA eGPUs without Resizable BAR** (Thunderbolt / USB4). It has been tested on one system
-only. Please read the limitations below and report your results.
+**Performance fix for NVIDIA eGPUs without Resizable BAR** (Thunderbolt / USB4). Please read the limitations
+below and report your results.
 
 ## What it does
 
