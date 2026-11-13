@@ -1990,6 +1990,7 @@ static long long ShScan(ShHeap* h, bool reset, uint64_t gap, std::vector<ShRg>* 
 static std::atomic<uint64_t> g_shBgFlushes{0}, g_shBgCopies{0}, g_shBgBytes{0}, g_shBgCpuTicks{0};
 static std::atomic<uint64_t> g_shBgSkipAlloc{0}, g_shBgSkipFlight{0}, g_shBgSkipMin{0};
 static std::atomic<bool> g_shStop{false};
+static std::atomic<uint64_t> g_shEclHotBytes{0}, g_shEclColdBytes{0}; // ECL-scan dirty bytes in hot / cold heaps
 
 // Copies what the CPU wrote since the last flush (caller holds g_shMutex). background: called by the
 // stream thread: scans only heaps that had dirty pages at their last scan, never blocks, skips the round
@@ -2023,7 +2024,7 @@ static void ShFlush(bool background)
         uint64_t peek = 0;
         for (int i = 0; i < t->n; ++i) {
             ShHeap* h = t->h[i];
-            if (h->released || (!h->hot && !h->needFull)) continue;
+            if (h->released || (!g_cfg.shadowStreamAll && !h->hot && !h->needFull)) continue;
             const long long n = ShScan(h, false, gap, nullptr, &peek);
             if (n == 0) h->hot = false;
         }
@@ -2035,13 +2036,18 @@ static void ShFlush(bool background)
     }
     for (int i = 0; i < t->n; ++i) {
         ShHeap* h = t->h[i];
-        if (background && (h->released || (!h->hot && !h->needFull))) continue;
+        if (background && (h->released || (!g_cfg.shadowStreamAll && !h->hot && !h->needFull))) continue;
         bool full = h->needFull;
         h->needFull = false;
         if (!full) {
+            const uint64_t before = dirty;
             const long long n = ShScan(h, true, gap, &rgs, &dirty);
             if (n < 0) full = true;
-            else h->hot = n > 0;
+            else {
+                // Diagnostics: at the ECL, was the dirty data in heaps the stream thread was watching?
+                if (!background) (h->hot ? g_shEclHotBytes : g_shEclColdBytes).fetch_add(dirty - before, std::memory_order_relaxed);
+                h->hot = n > 0;
+            }
         } else {
             ResetWriteWatch(h->shadow, h->size);
         }
@@ -3686,6 +3692,7 @@ struct StatsState {
     uint64_t prevHybUnion = 0, prevHybRecopy = 0, prevHybAsync = 0;
     uint64_t prevShSyncs = 0, prevShCopy = 0, prevShDirty = 0, prevShRegions = 0, prevShGww = 0, prevShWaits = 0, prevShBytes = 0;
     uint64_t prevShBgFl = 0, prevShBgCp = 0, prevShBgBytes = 0, prevShBgCpu = 0, prevShSkA = 0, prevShSkF = 0, prevShSkM = 0;
+    uint64_t prevShEclHot = 0, prevShEclCold = 0;
     std::map<DWORD, uint64_t> prevThreadCpu; // thread id -> user+kernel time (100 ns)
 };
 
@@ -3711,10 +3718,13 @@ static void AppendShadowStats(std::string& s, StatsState& st, double div, const 
         const double bgMB = MB(bb - st.prevShBgBytes) / div;
         const double eclMB = MB(dCb - (bb - st.prevShBgBytes)) / div;
         Appendf(s, " | stream %d us%s: flushes %.1f (with copies %.1f), background %.2f MB vs ECL %.2f MB, skipped: no allocator %.1f,"
-                   " in-flight limit %.1f, below %d KB %.1f, stream thread CPU %.3f ms",
+                   " in-flight limit %.1f, below %d KB %.1f, stream thread CPU %.3f ms | ECL dirty in hot heaps %.2f MB, cold %.2f MB%s",
                 g_cfg.shadowStreamUs, per, (bf - st.prevShBgFl) / div, (bc - st.prevShBgCp) / div, bgMB, eclMB,
                 (sa - st.prevShSkA) / div, (sf - st.prevShSkF) / div, g_cfg.shadowStreamMinKB, (sm - st.prevShSkM) / div,
-                (bt - st.prevShBgCpu) * 1000.0 / (double)g_qpf.QuadPart / div);
+                (bt - st.prevShBgCpu) * 1000.0 / (double)g_qpf.QuadPart / div,
+                MB(g_shEclHotBytes.load() - st.prevShEclHot) / div, MB(g_shEclColdBytes.load() - st.prevShEclCold) / div,
+                g_cfg.shadowStreamAll ? " (all heaps scanned)" : "");
+        st.prevShEclHot = g_shEclHotBytes.load(); st.prevShEclCold = g_shEclColdBytes.load();
         st.prevShBgFl = bf; st.prevShBgCp = bc; st.prevShBgBytes = bb; st.prevShBgCpu = bt;
         st.prevShSkA = sa; st.prevShSkF = sf; st.prevShSkM = sm;
     }

@@ -39,6 +39,7 @@ struct Config {
     int  shadowMergeKB    = 16;    // [Fix] ShadowMergeKB: dirty ranges closer than this are merged into one copy
     int  shadowStreamUs   = 0;     // [Fix] ShadowStreamUs: background flush period in us (0 = off, else 200..20000)
     int  shadowStreamMinKB = 64;   // [Fix] ShadowStreamMinKB: a background round copies only if at least this much is dirty
+    bool shadowStreamAll  = false; // [Fix] ShadowStreamAllHeaps: background rounds scan every heap, not only the hot ones
     int  shadowStreamMaxInFlight = 2; // [Fix] ShadowStreamMaxInFlight: background rounds skipped while this many copies are pending
     bool shadowNoCopy     = false; // [Fix] ShadowTestNoCopy: never copy shadow -> VRAM (negative test, must break rendering)
 };

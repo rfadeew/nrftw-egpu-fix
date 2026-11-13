@@ -117,6 +117,7 @@ static void ReadConfig(const wchar_t* ini)
     g_cfg.shadowStreamUs   = IniInt(L"Fix", L"ShadowStreamUs", d.shadowStreamUs, ini);
     g_cfg.shadowStreamMinKB = IniInt(L"Fix", L"ShadowStreamMinKB", d.shadowStreamMinKB, ini);
     g_cfg.shadowStreamMaxInFlight = IniInt(L"Fix", L"ShadowStreamMaxInFlight", d.shadowStreamMaxInFlight, ini);
+    g_cfg.shadowStreamAll  = IniBool(L"Fix", L"ShadowStreamAllHeaps", d.shadowStreamAll, ini);
     if (g_cfg.shadowStreamUs != 0) {
         if (g_cfg.shadowStreamUs < 200) g_cfg.shadowStreamUs = 200;
         if (g_cfg.shadowStreamUs > 20000) g_cfg.shadowStreamUs = 20000;
@@ -222,14 +223,14 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
     ReadConfig(iniPath);
     Log("config: Hooks=%d Measure=%d IntervalSec=%d VidmemHeaps=%d VidmemBuffers=%d VidmemBufMaxKB=%d VidmemReserveMB=%d"
         " VidmemCapMB=%d VidmemWithReBAR=%d | HybridHeaps=%d HybridSrv=%d HybridSrvCopies=%d HybridMergeKB=%d"
-        " HybridCopyQueue=%d HybridCheck=%d%s | ShadowHeaps=%d ShadowMergeKB=%d ShadowStreamUs=%d ShadowStreamMinKB=%d ShadowStreamMaxInFlight=%d%s"
+        " HybridCopyQueue=%d HybridCheck=%d%s | ShadowHeaps=%d ShadowMergeKB=%d ShadowStreamUs=%d ShadowStreamMinKB=%d ShadowStreamMaxInFlight=%d ShadowStreamAllHeaps=%d%s"
         " | GpuTiming=%d KmtStats=%d LogCreateLimit=%d TopN=%d ConstPages=%d CbvPad=%d LoadPix=%d (ini %s)",
         g_cfg.hooks, g_cfg.measure, g_cfg.statsIntervalSec, g_cfg.vidmemHeaps, g_cfg.vidmemBuffers, g_cfg.vidmemBufMaxKB,
         g_cfg.vidmemReserveMB, g_cfg.vidmemCapMB, g_cfg.vidmemWithReBAR, g_cfg.hybridHeaps, g_cfg.hybridSrv,
         g_cfg.hybridSrvCopies, g_cfg.hybridMergeKB, g_cfg.hybridCopyQueue, g_cfg.hybridCheck,
         g_cfg.hybridNoCopy ? " HybridTestNoCopy=1 (TEST: no copies)" : "",
         g_cfg.shadowHeaps, g_cfg.shadowMergeKB, g_cfg.shadowStreamUs, g_cfg.shadowStreamMinKB,
-        g_cfg.shadowStreamMaxInFlight, g_cfg.shadowNoCopy ? " ShadowTestNoCopy=1 (TEST: no copies)" : "",
+        g_cfg.shadowStreamMaxInFlight, (int)g_cfg.shadowStreamAll, g_cfg.shadowNoCopy ? " ShadowTestNoCopy=1 (TEST: no copies)" : "",
         g_cfg.gpuTiming, g_cfg.kmtStats, g_cfg.logCreateLimit, g_cfg.topN, g_cfg.constPages, g_cfg.cbvPad, g_cfg.loadPix,
         GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES ? "found" : "missing, defaults");
 
