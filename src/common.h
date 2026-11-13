@@ -37,6 +37,9 @@ struct Config {
     bool hybridNoCopy     = false; // [Fix] HybridTestNoCopy: redirect but never copy (negative test, must break rendering)
     bool shadowHeaps      = false; // [Fix] ShadowHeaps: UPLOAD heaps live in VRAM, CPU writes go to a sysmem shadow (stage 2e)
     int  shadowMergeKB    = 16;    // [Fix] ShadowMergeKB: dirty ranges closer than this are merged into one copy
+    int  shadowStreamUs   = 0;     // [Fix] ShadowStreamUs: background flush period in us (0 = off, else 200..20000)
+    int  shadowStreamMinKB = 64;   // [Fix] ShadowStreamMinKB: a background round copies only if at least this much is dirty
+    int  shadowStreamMaxInFlight = 2; // [Fix] ShadowStreamMaxInFlight: background rounds skipped while this many copies are pending
     bool shadowNoCopy     = false; // [Fix] ShadowTestNoCopy: never copy shadow -> VRAM (negative test, must break rendering)
 };
 extern Config g_cfg;
