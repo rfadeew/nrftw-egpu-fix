@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.0 (unreleased)
+## v0.2.0 (2026-11-13)
 
 - New default fix, "stage 2e" (`[Fix] ShadowHeaps=1`): the game's `UPLOAD` heaps are created as `DEFAULT` heaps
   in VRAM. `Map` of a buffer in them returns a system-memory "shadow" (`VirtualAlloc` with `MEM_WRITE_WATCH`,

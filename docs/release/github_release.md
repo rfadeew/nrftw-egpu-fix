@@ -86,8 +86,8 @@ that log.
 ## Checksums (SHA-256)
 
 ```
-SHA256_TBD  No-Rest-for-the-Wicked-eGPU-Fix-v0.2.0.zip
-SHA256_TBD  version.dll
+154cadf2de20306c36d9f31e233830733f504de02d8ef399f8200473a85b111a  No-Rest-for-the-Wicked-eGPU-Fix-v0.2.0.zip
+97a72d887b3e8300bcbb07388f839dc545bf51ed9e4e6c9e806b4746b7c70ce2  version.dll
 ```
 
 MIT License. Uses [MinHook](https://github.com/TsudaKageyu/minhook) (BSD 2-clause). Not affiliated with Moon
