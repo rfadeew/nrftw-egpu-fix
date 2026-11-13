@@ -1,5 +1,5 @@
 <!-- Tag: v0.2.0 | Title: No Rest for the Wicked eGPU Fix v0.2.0 | Set as the latest release -->
-<!-- Attach: dist/No-Rest-for-the-Wicked-eGPU-Fix-v0.2.0.zip. SHA-256 below are placeholders: rebuild with package.bat and fill them in before publishing. -->
+<!-- Attach: dist/No-Rest-for-the-Wicked-eGPU-Fix-v0.2.0.zip. SHA-256 below match this zip; rerun package.bat and update them if it is rebuilt. -->
 
 **Performance fix for NVIDIA eGPUs without Resizable BAR** (Thunderbolt / USB4). Please read the limitations
 below and report your results.
