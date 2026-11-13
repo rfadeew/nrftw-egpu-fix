@@ -942,6 +942,8 @@ static PFN_CreateCommittedResource CreateCommittedResource;
 static std::atomic<bool> g_vidOn{false};   // set (release) after g_vidLuid / g_vidAdapter / nv:: are ready
 static std::atomic<bool> g_hybOn{false};   // stage 2d runs for the device g_vidLuid (set after g_vidLuid)
 static const char* g_hybOffReason = "no D3D12 device yet";
+static std::atomic<bool> g_shOn{false};    // stage 2e runs for the device g_vidLuid
+static const char* g_shOffReason = "no D3D12 device yet";
 static LUID g_vidLuid = {};                // the device the fixes run for (2c and/or 2d)
 static const char* g_vidOffReason = "no D3D12 device yet"; // for the stats line while g_vidOn is false
 static bool g_nvQueryOk = false;           // QueryCpuVisibleVidmem works (budget from the driver)
@@ -1014,9 +1016,10 @@ static void InitVidmem(ID3D12Device* dev)
     const bool want2c = g_cfg.vidmemHeaps || g_cfg.vidmemBuffers;
     if (!want2c) g_vidOffReason = "disabled in egpu_fix.ini";
     if (!g_cfg.hybridHeaps) g_hybOffReason = "disabled in egpu_fix.ini";
-    if (!want2c && !g_cfg.hybridHeaps) return;
+    if (!g_cfg.shadowHeaps) g_shOffReason = "disabled in egpu_fix.ini";
+    if (!want2c && !g_cfg.hybridHeaps && !g_cfg.shadowHeaps) return;
     // Already running for a device (D3D12 returns the same device per adapter).
-    if (g_vidOn.load() || g_hybOn.load()) return;
+    if (g_vidOn.load() || g_hybOn.load() || g_shOn.load()) return;
     const LUID luid = dev->GetAdapterLuid();
     static std::vector<LUID> seen;
     for (const LUID& l : seen) if (SameLuid(l, luid)) return;
@@ -1036,6 +1039,7 @@ static void InitVidmem(ID3D12Device* dev)
     auto off = [&](const char* reason) {
         if (want2c) g_vidOffReason = reason;
         if (g_cfg.hybridHeaps) g_hybOffReason = reason;
+        if (g_cfg.shadowHeaps) g_shOffReason = reason;
         if (ad) ad->Release();
     };
     DXGI_ADAPTER_DESC1 desc = {};
@@ -1059,6 +1063,24 @@ static void InitVidmem(ID3D12Device* dev)
         return;
     }
     g_vidLuid = luid;
+    if (g_cfg.shadowHeaps) {
+        D3D12_FEATURE_DATA_EXISTING_HEAPS eh = {};
+        ID3D12Device3* d3 = nullptr;
+        const bool ok = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_EXISTING_HEAPS, &eh, sizeof(eh))) && eh.Supported &&
+                        SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d3))) && d3;
+        if (d3) d3->Release();
+        if (ok) {
+            Log("shadow: stage 2e ON for %ls: the game's UPLOAD heaps become DEFAULT (VRAM) heaps; Map returns a sysmem"
+                " shadow (write-watched), dirty pages are copied at each game ExecuteCommandLists (merge gaps <= %d KB)%s",
+                desc.Description, g_cfg.shadowMergeKB,
+                g_cfg.shadowNoCopy ? " -- TEST MODE: copies disabled, rendering WILL be wrong" : "");
+            g_shOffReason = "";
+            g_shOn.store(true, std::memory_order_release);
+        } else {
+            Log("shadow: stage 2e OFF: existing heaps (OpenExistingHeapFromAddress) not supported by this device");
+            g_shOffReason = "existing heaps not supported";
+        }
+    }
     if (g_cfg.hybridHeaps) {
         Log("hybrid: stage 2d ON for %ls: UPLOAD heaps not placed in CPU-visible VRAM get a DEFAULT mirror"
             " (VB/IB redirects; SRV redirects %s, %d copies per new SRV; HybridCheck %s)%s", desc.Description,
@@ -1681,6 +1703,315 @@ static void HybPollRetire()
     }
 }
 
+// ============================================================================
+// Stage 2e: shadow heaps (UPLOAD heaps that live in VRAM)
+// ============================================================================
+// The game's UPLOAD heap becomes a DEFAULT heap in VRAM ("vheap", what the game
+// gets), so every GPU read of its buffers (VB/IB/SRV/CBV/indirect/copies, any
+// queue) hits VRAM and no redirects are needed. The CPU side lives in a
+// system-memory "shadow" (VirtualAlloc with MEM_WRITE_WATCH):
+//   * ID3D12Resource::Map / Unmap of a buffer inside a vheap are answered by us
+//     (D3D12 refuses Map on DEFAULT heaps): shadow + (VA - heap base VA).
+//   * The shadow is wrapped as a D3D12 heap (OpenExistingHeapFromAddress) with a
+//     whole-heap CROSS_ADAPTER buffer "src"; "dst" is the whole-heap buffer at
+//     offset 0 of the vheap. A placed buffer's GPU VA is heap VA + offset, so
+//     a VA in [vaLo, vaLo + size) maps to shadow + (VA - vaLo).
+//   * At every game ExecuteCommandLists (any queue) GetWriteWatch tells which
+//     pages the CPU wrote; they are copied src -> dst on our own COPY queue and
+//     the game's queue waits for that copy (capture -> submit -> Wait happen
+//     under one mutex, so every later game submission waits for every earlier
+//     capture; the copy carries whatever the CPU wrote before the submission).
+//   * GetHeapProperties / Heap::GetDesc report UPLOAD for these objects.
+// Heaps are never retired: we keep vheap, dst and the shadow for the process
+// lifetime (the game's UPLOAD heap pool only grows). Placed resources may
+// outlive the heap and still be mapped into the shadow, and a released VA
+// range could be reused by an unrelated buffer that Map must not redirect.
+static constexpr int kMaxShHeaps = 256;
+
+struct ShHeap {
+    uint64_t id = 0;
+    ID3D12Heap* vheap = nullptr;     // DEFAULT heap the game got; we hold one reference for the process lifetime
+    ID3D12Heap* sheap = nullptr;     // the shadow memory as a D3D12 heap
+    ID3D12Resource* src = nullptr;   // whole-heap CROSS_ADAPTER buffer in sheap (copy source)
+    ID3D12Resource* dst = nullptr;   // whole-heap buffer at offset 0 of vheap (copy target)
+    uint8_t* shadow = nullptr;
+    uint64_t size = 0, vaLo = 0;
+    std::vector<void*> pages;        // GetWriteWatch output (g_shMutex)
+    // Next sync copies the whole heap (g_shMutex): only after a failed copy submission. Not at
+    // creation: the DEFAULT heap and the VirtualAlloc'ed shadow both start zeroed.
+    bool needFull = false;
+};
+struct ShTable { int n; ShHeap* h[kMaxShHeaps]; };
+static std::atomic<const ShTable*> g_shTable{nullptr}; // immutable snapshots (old ones are leaked: tiny, rare)
+static std::mutex g_shTableMutex;                      // writers of the table / heap creation
+static std::mutex g_shMutex;                           // sync: capture -> submit -> wait, g_sh
+static std::atomic<uint64_t> g_shHeaps{0}, g_shLiveBytes{0}, g_shFailed{0};
+static std::atomic<uint64_t> g_shSyncs{0}, g_shSyncsCopy{0}, g_shDirtyBytes{0}, g_shRegions{0}, g_shCopyBytes{0};
+static std::atomic<uint64_t> g_shGwwTicks{0}, g_shWaits{0}, g_shCopyFail{0};
+
+struct ShCtx {                                         // guarded by g_shMutex
+    ID3D12Device* dev = nullptr;
+    ID3D12CommandQueue* cq = nullptr;                  // our COPY queue
+    ID3D12Fence* fence = nullptr;
+    ID3D12GraphicsCommandList* list = nullptr;
+    HANDLE ev = nullptr;
+    std::vector<FixAlloc> allocs;
+    bool tried = false;
+};
+static ShCtx g_sh;
+static uint64_t g_shValue = 0;                         // last value signaled on g_sh.fence (g_shMutex)
+
+static bool ShDevice(ID3D12Device* d)
+{
+    return g_shOn.load(std::memory_order_acquire) && SameLuid(d->GetAdapterLuid(), g_vidLuid);
+}
+
+// The ShHeap whose vheap range holds va; nullptr if none.
+static inline ShHeap* FindSh(uint64_t va)
+{
+    const ShTable* t = g_shTable.load(std::memory_order_acquire);
+    if (!t || !va) return nullptr;
+    for (int i = 0; i < t->n; ++i)
+        if (va - t->h[i]->vaLo < t->h[i]->size) return t->h[i];
+    return nullptr;
+}
+static bool IsShVheap(const ID3D12Heap* heap)
+{
+    const ShTable* t = g_shTable.load(std::memory_order_acquire);
+    if (!t) return false;
+    for (int i = 0; i < t->n; ++i)
+        if (t->h[i]->vheap == heap) return true;
+    return false;
+}
+
+static void PublishShTable(ShHeap* add) // caller holds g_shTableMutex
+{
+    const ShTable* cur = g_shTable.load(std::memory_order_relaxed);
+    ShTable* t = new ShTable();
+    t->n = 0;
+    if (cur)
+        for (int i = 0; i < cur->n; ++i) t->h[t->n++] = cur->h[i];
+    if (add && t->n < kMaxShHeaps) t->h[t->n++] = add;
+    g_shTable.store(t, std::memory_order_release);
+}
+
+// Our COPY queue, fence and list (once). False: stage 2e cannot work.
+static bool ShEnsureCtx(ID3D12Device* d)
+{
+    std::lock_guard<std::mutex> lk(g_shMutex);
+    ShCtx& c = g_sh;
+    if (c.cq) return true;
+    if (c.tried) return false;
+    c.tried = true;
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    ID3D12CommandAllocator* a = nullptr;
+    HRESULT hr = d->CreateCommandQueue(&qd, IID_PPV_ARGS(&c.cq));
+    if (SUCCEEDED(hr)) hr = d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&c.fence));
+    if (SUCCEEDED(hr)) hr = d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&a));
+    if (SUCCEEDED(hr)) hr = d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, a, nullptr, IID_PPV_ARGS(&c.list));
+    if (SUCCEEDED(hr)) hr = c.list->Close();
+    c.ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (FAILED(hr) || !c.ev) {
+        Log("shadow: cannot create the COPY queue / fence / list (0x%08lx): stage 2e cannot copy, heaps stay as the game made them", hr);
+        if (a) a->Release();
+        if (c.list) c.list->Release();
+        if (c.fence) c.fence->Release();
+        if (c.cq) c.cq->Release();
+        c.list = nullptr; c.fence = nullptr; c.cq = nullptr;
+        return false;
+    }
+    c.dev = d;
+    d->AddRef(); // process lifetime
+    c.allocs.push_back({ a, 0 });
+    c.cq->SetName(L"egpu_fix shadow COPY queue");
+    Log("shadow: COPY queue %p ready", c.cq);
+    return true;
+}
+
+// Index of an allocator the GPU is done with (grows the pool or waits); -1 on failure (caller holds g_shMutex).
+static int ShAcquireAlloc(ShCtx& c)
+{
+    const uint64_t done = c.fence->GetCompletedValue();
+    size_t oldest = 0;
+    for (size_t i = 0; i < c.allocs.size(); ++i) {
+        if (c.allocs[i].fence <= done) return (int)i;
+        if (c.allocs[i].fence < c.allocs[oldest].fence) oldest = i;
+    }
+    if (c.allocs.size() < kMaxFixAllocators) {
+        ID3D12CommandAllocator* a = nullptr;
+        if (SUCCEEDED(c.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&a))) && a) {
+            c.allocs.push_back({ a, 0 });
+            return (int)c.allocs.size() - 1;
+        }
+    }
+    const uint64_t want = c.allocs[oldest].fence;
+    if (SUCCEEDED(c.fence->SetEventOnCompletion(want, c.ev)) && c.fence->GetCompletedValue() < want)
+        WaitForSingleObject(c.ev, 5000);
+    return c.fence->GetCompletedValue() >= want ? (int)oldest : -1;
+}
+
+// Game CreateHeap(1) of an UPLOAD heap on the fix's device: returns true when *ppv is the vheap.
+static bool TryShadowHeap(ID3D12Device* d, const D3D12_HEAP_DESC* hd, REFIID riid, void** ppv)
+{
+    if (!g_cfg.shadowHeaps || t_inFix || !hd || !ppv || hd->Properties.Type != D3D12_HEAP_TYPE_UPLOAD || !ShDevice(d))
+        return false;
+    if (hd->Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) return false;
+    const uint64_t size = hd->SizeInBytes;
+    if (!size || (size & 0xffff)) {
+        static bool warned = false;
+        if (!warned) { warned = true; Log("shadow: UPLOAD heap of %llu bytes (not a multiple of 64 KB) stays a normal heap", size); }
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(g_shTableMutex);
+    const ShTable* cur = g_shTable.load(std::memory_order_relaxed);
+    if (cur && cur->n >= kMaxShHeaps) {
+        static bool warned = false;
+        if (!warned) { warned = true; Log("shadow: %d heaps, no more shadows", kMaxShHeaps); }
+        return false;
+    }
+    if (!ShEnsureCtx(d)) return false;
+
+    ShHeap* h = new ShHeap;
+    h->size = size;
+    ID3D12Device3* d3 = nullptr;
+    HRESULT hr = d->QueryInterface(IID_PPV_ARGS(&d3));
+    const char* step = "QueryInterface(Device3)";
+    if (SUCCEEDED(hr)) {
+        step = "VirtualAlloc";
+        h->shadow = (uint8_t*)VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+        if (!h->shadow) hr = HRESULT_FROM_WIN32(GetLastError());
+    }
+    if (SUCCEEDED(hr)) { step = "OpenExistingHeapFromAddress"; hr = d3->OpenExistingHeapFromAddress(h->shadow, IID_PPV_ARGS(&h->sheap)); }
+    D3D12_RESOURCE_DESC wd = BufferDesc(size);
+    if (SUCCEEDED(hr)) {
+        step = "placed shadow buffer";
+        wd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        hr = PlaceRaw(d, h->sheap, 0, &wd, D3D12_RESOURCE_STATE_COMMON, &h->src);
+    }
+    D3D12_HEAP_DESC vd = *hd;
+    vd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    vd.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    vd.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    if (SUCCEEDED(hr)) {
+        step = "DEFAULT heap";
+        hr = o_CH ? o_CH(d, &vd, IID_PPV_ARGS(&h->vheap)) : d->CreateHeap(&vd, IID_PPV_ARGS(&h->vheap));
+    }
+    if (SUCCEEDED(hr)) {
+        step = "placed VRAM buffer";
+        wd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        hr = PlaceRaw(d, h->vheap, 0, &wd, D3D12_RESOURCE_STATE_COMMON, &h->dst);
+    }
+    if (SUCCEEDED(hr)) { step = "QueryInterface(heap)"; hr = h->vheap->QueryInterface(riid, ppv); }
+    if (d3) d3->Release();
+    if (FAILED(hr)) {
+        g_shFailed.fetch_add(1, std::memory_order_relaxed);
+        Log("shadow: UPLOAD heap %.2f MB failed at '%s' (0x%08lx); it is created as without stage 2e", MB(size), step, hr);
+        if (h->dst) h->dst->Release();
+        if (h->vheap) h->vheap->Release();
+        if (h->src) h->src->Release();
+        if (h->sheap) h->sheap->Release();
+        if (h->shadow) VirtualFree(h->shadow, 0, MEM_RELEASE); // nothing was ever mapped into it
+        delete h;
+        return false;
+    }
+    h->vaLo = h->dst->GetGPUVirtualAddress();
+    h->pages.resize(size / 4096);
+    ResetWriteWatch(h->shadow, size);
+    h->id = g_shHeaps.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_shLiveBytes.fetch_add(size, std::memory_order_relaxed);
+    h->src->SetName(L"egpu_fix shadow source (whole heap)");
+    h->dst->SetName(L"egpu_fix shadow target (whole heap)");
+    PublishShTable(h);
+    Log("shadow: UPLOAD heap #%llu %.2f MB (flags 0x%x, align %llu): shadow %p, VRAM heap VA 0x%llx (live %.0f MB)",
+        h->id, MB(size), (unsigned)hd->Flags, hd->Alignment, (void*)h->shadow, h->vaLo, MB(g_shLiveBytes.load()));
+    return true;
+}
+
+// Game submission on any queue: copy what the CPU wrote since the last sync, then make q wait for it.
+static void ShadowSync(ID3D12CommandQueue* q)
+{
+    const ShTable* t = g_shTable.load(std::memory_order_acquire);
+    if (!t) return;
+    std::lock_guard<std::mutex> lk(g_shMutex);
+    ShCtx& c = g_sh;
+    if (!c.cq) return;
+    g_shSyncs.fetch_add(1, std::memory_order_relaxed);
+
+    struct Rg { ShHeap* h; uint64_t lo, hi; };
+    static std::vector<Rg> rgs; // g_shMutex
+    rgs.clear();
+    const int64_t t0 = Qpc();
+    uint64_t dirty = 0;
+    const uint64_t gap = (uint64_t)g_cfg.shadowMergeKB << 10;
+    for (int i = 0; i < t->n; ++i) {
+        ShHeap* h = t->h[i];
+        bool full = h->needFull;
+        h->needFull = false;
+        if (!full) {
+            ULONG_PTR cnt = h->pages.size();
+            DWORD gran = 0;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, h->shadow, h->size, h->pages.data(), &cnt, &gran) != 0 || !gran) {
+                static bool warned = false;
+                if (!warned) { warned = true; Log("shadow: GetWriteWatch failed (error %lu); copying whole heaps", GetLastError()); }
+                full = true;
+            } else {
+                const size_t first = rgs.size();
+                for (ULONG_PTR k = 0; k < cnt; ++k) {
+                    const uint64_t off = (uint8_t*)h->pages[k] - h->shadow;
+                    dirty += gran;
+                    if (rgs.size() > first && off <= rgs.back().hi + gap) rgs.back().hi = off + gran;
+                    else rgs.push_back({ h, off, off + gran });
+                }
+                if (rgs.size() > first && rgs.back().hi > h->size) rgs.back().hi = h->size;
+            }
+        } else {
+            ResetWriteWatch(h->shadow, h->size);
+        }
+        if (full) { rgs.push_back({ h, 0, h->size }); dirty += h->size; }
+    }
+    g_shGwwTicks.fetch_add((uint64_t)(Qpc() - t0), std::memory_order_relaxed);
+    if (g_cfg.shadowNoCopy) rgs.clear(); // negative test: VRAM stays stale
+    if (!rgs.empty()) {
+        bool ok = false;
+        const int ai = ShAcquireAlloc(c);
+        if (ai >= 0) {
+            FixAlloc& fa = c.allocs[ai];
+            ++t_inFix;
+            HRESULT hr = fa.alloc->Reset();
+            if (SUCCEEDED(hr)) hr = c.list->Reset(fa.alloc, nullptr);
+            if (SUCCEEDED(hr)) {
+                for (const Rg& r : rgs) c.list->CopyBufferRegion(r.h->dst, r.lo, r.h->src, r.lo, r.hi - r.lo);
+                hr = c.list->Close();
+                if (SUCCEEDED(hr)) {
+                    ID3D12CommandList* cl = c.list;
+                    c.cq->ExecuteCommandLists(1, &cl);
+                    const uint64_t v = g_shValue + 1;
+                    hr = c.cq->Signal(c.fence, v);
+                    if (SUCCEEDED(hr)) { g_shValue = v; fa.fence = v; ok = true; }
+                }
+            }
+            --t_inFix;
+            if (FAILED(hr)) Log("shadow: copy submission failed (0x%08lx)", hr);
+        }
+        if (ok) {
+            g_shSyncsCopy.fetch_add(1, std::memory_order_relaxed);
+            g_shRegions.fetch_add(rgs.size(), std::memory_order_relaxed);
+            g_shDirtyBytes.fetch_add(dirty, std::memory_order_relaxed);
+            uint64_t cb = 0;
+            for (const Rg& r : rgs) cb += r.hi - r.lo;
+            g_shCopyBytes.fetch_add(cb, std::memory_order_relaxed);
+        } else {
+            g_shCopyFail.fetch_add(1, std::memory_order_relaxed);
+            for (const Rg& r : rgs) r.h->needFull = true; // try everything again at the next submission
+        }
+    }
+    if (c.fence->GetCompletedValue() < g_shValue) {
+        q->Wait(c.fence, g_shValue);
+        g_shWaits.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 // ---- VB / IB views --------------------------------------------------------------
 // Returns the views to pass on: v itself, or tmp with views into mirrored heaps redirected.
 static const D3D12_VERTEX_BUFFER_VIEW* HybVB(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v,
@@ -2172,13 +2503,14 @@ static HRESULT STDMETHODCALLTYPE Hook_CPR2(ID3D12Device10* d, ID3D12Heap* heap, 
 static HRESULT STDMETHODCALLTYPE Hook_CH(ID3D12Device* d, const D3D12_HEAP_DESC* hd, REFIID riid, void** ppv)
 {
     CreateGuard g;
-    bool vid = false;
+    bool vid = false, shadow = false;
     HRESULT hr = S_OK;
-    if (!(g.outer && TryVidHeap(d, hd, riid, ppv, &vid)))
+    if (g.outer && TryShadowHeap(d, hd, riid, ppv)) shadow = true; // stage 2e first
+    else if (!(g.outer && TryVidHeap(d, hd, riid, ppv, &vid)))
         hr = o_CH(d, hd, riid, ppv);
     if (g.outer && SUCCEEDED(hr) && ppv && *ppv) {
-        if (!vid) HybOnHeapCreated(d, hd, *ppv);
-        OnHeapCreated(vid ? "CreateHeap -> CPU-visible VRAM" : "CreateHeap", hd, *ppv, vid);
+        if (!vid && !shadow) HybOnHeapCreated(d, hd, *ppv);
+        OnHeapCreated(vid ? "CreateHeap -> CPU-visible VRAM" : shadow ? "CreateHeap -> shadow (VRAM)" : "CreateHeap", hd, *ppv, vid);
     }
     return hr;
 }
@@ -2186,13 +2518,14 @@ static HRESULT STDMETHODCALLTYPE Hook_CH1(ID3D12Device4* d, const D3D12_HEAP_DES
                                           REFIID riid, void** ppv)
 {
     CreateGuard g;
-    bool vid = false;
+    bool vid = false, shadow = false;
     HRESULT hr = S_OK;
-    if (!(g.outer && !ps && TryVidHeap(d, hd, riid, ppv, &vid)))
+    if (g.outer && !ps && TryShadowHeap(d, hd, riid, ppv)) shadow = true; // stage 2e first
+    else if (!(g.outer && !ps && TryVidHeap(d, hd, riid, ppv, &vid)))
         hr = o_CH1(d, hd, ps, riid, ppv);
     if (g.outer && SUCCEEDED(hr) && ppv && *ppv) {
-        if (!vid && !ps) HybOnHeapCreated(d, hd, *ppv);
-        OnHeapCreated(vid ? "CreateHeap1 -> CPU-visible VRAM" : "CreateHeap1", hd, *ppv, vid);
+        if (!vid && !shadow && !ps) HybOnHeapCreated(d, hd, *ppv);
+        OnHeapCreated(vid ? "CreateHeap1 -> CPU-visible VRAM" : shadow ? "CreateHeap1 -> shadow (VRAM)" : "CreateHeap1", hd, *ppv, vid);
     }
     return hr;
 }
@@ -2221,19 +2554,108 @@ static void STDMETHODCALLTYPE Hook_CSRV(ID3D12Device* d, ID3D12Resource* res, co
 
 // ---- ID3D12Resource::Map -----------------------------------------------------------
 using PFN_Map = HRESULT(STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
-static PFN_Map o_Map;
 static std::atomic<bool> g_resHooksInstalled{false};
 static std::atomic<void*> g_mapTarget{nullptr};
 
-static HRESULT STDMETHODCALLTYPE Hook_Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* rr, void** pp)
+using PFN_Unmap = void(STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*);
+using PFN_GetHeapProps = HRESULT(STDMETHODCALLTYPE*)(ID3D12Resource*, D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS*);
+using PFN_HeapGetDesc = D3D12_HEAP_DESC*(STDMETHODCALLTYPE*)(ID3D12Heap*, D3D12_HEAP_DESC*);
+
+// ID3D12Resource methods (one instance per distinct implementation, if the runtime has several).
+// Map / Unmap: stage 2e answers them for buffers in a vheap (shadow memory), the rest is the
+// Measure=1 Map accounting. GetHeapProperties: stage 2e resources look like UPLOAD ones.
+template <int V> struct ResHooks {
+    static inline PFN_Map oMap;
+    static inline PFN_Unmap oUnmap;
+    static inline PFN_GetHeapProps oGhp;
+    static HRESULT STDMETHODCALLTYPE Map(ID3D12Resource* r, UINT sub, const D3D12_RANGE* rr, void** pp)
+    {
+        if (g_shTable.load(std::memory_order_relaxed)) {
+            const uint64_t va = r->GetGPUVirtualAddress();
+            if (ShHeap* h = FindSh(va)) {
+                if (pp) *pp = h->shadow + (va - h->vaLo);
+                return S_OK;
+            }
+        }
+        if (!g_cfg.measure) return oMap(r, sub, rr, pp);
+        const int64_t t0 = Qpc();
+        HRESULT hr = oMap(r, sub, rr, pp);
+        AddTime(g_apiTime[AT_MAP], Qpc() - t0);
+        Bump(TS()->misc[M_MAP]);
+        if (const uint64_t va = r->GetGPUVirtualAddress())
+            if (ResRec* rec = Lookup(va)) rec->maps.fetch_add(1, std::memory_order_relaxed);
+        return hr;
+    }
+    static void STDMETHODCALLTYPE Unmap(ID3D12Resource* r, UINT sub, const D3D12_RANGE* rr)
+    {
+        if (g_shTable.load(std::memory_order_relaxed) && FindSh(r->GetGPUVirtualAddress())) return;
+        oUnmap(r, sub, rr);
+    }
+    static HRESULT STDMETHODCALLTYPE GetHeapProps(ID3D12Resource* r, D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS* hf)
+    {
+        const HRESULT hr = oGhp(r, hp, hf);
+        if (SUCCEEDED(hr) && hp && g_shTable.load(std::memory_order_relaxed) && FindSh(r->GetGPUVirtualAddress())) {
+            hp->Type = D3D12_HEAP_TYPE_UPLOAD;
+            hp->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            hp->MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        }
+        return hr;
+    }
+};
+static PFN_HeapGetDesc o_HeapGetDesc;
+static D3D12_HEAP_DESC* STDMETHODCALLTYPE Hook_HeapGetDesc(ID3D12Heap* h, D3D12_HEAP_DESC* ret)
 {
-    const int64_t t0 = Qpc();
-    HRESULT hr = o_Map(r, sub, rr, pp);
-    AddTime(g_apiTime[AT_MAP], Qpc() - t0);
-    Bump(TS()->misc[M_MAP]);
-    if (const uint64_t va = r->GetGPUVirtualAddress())
-        if (ResRec* rec = Lookup(va)) rec->maps.fetch_add(1, std::memory_order_relaxed);
-    return hr;
+    D3D12_HEAP_DESC* r = o_HeapGetDesc(h, ret);
+    if (r && IsShVheap(h)) {
+        r->Properties.Type = D3D12_HEAP_TYPE_UPLOAD;
+        r->Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        r->Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    }
+    return r;
+}
+
+// Hooks Map (and, for stage 2e, Unmap / GetHeapProperties) of the resource class with vtable vt;
+// ref: vtable of variant 0 (slots with the same implementation are not hooked again).
+template <int V> static void InstallResVT(void** vt, void** ref)
+{
+    if (!ref || vt[g_vtbl.Resource_Map] != ref[g_vtbl.Resource_Map])
+        HookVT(vt, g_vtbl.Resource_Map, (void*)&ResHooks<V>::Map, (void**)&ResHooks<V>::oMap, "Resource::Map");
+    if (!g_cfg.shadowHeaps) return;
+    if (!ref || vt[g_vtbl.Resource_Unmap] != ref[g_vtbl.Resource_Unmap])
+        HookVT(vt, g_vtbl.Resource_Unmap, (void*)&ResHooks<V>::Unmap, (void**)&ResHooks<V>::oUnmap, "Resource::Unmap");
+    if (!ref || vt[g_vtbl.Resource_GetHeapProperties] != ref[g_vtbl.Resource_GetHeapProperties])
+        HookVT(vt, g_vtbl.Resource_GetHeapProperties, (void*)&ResHooks<V>::GetHeapProps, (void**)&ResHooks<V>::oGhp,
+               "Resource::GetHeapProperties");
+}
+
+// Stage 2e: hooks before the game's first Map, from temporary objects: an UPLOAD buffer, a placed
+// DEFAULT buffer (may be another class) and a heap (caller holds g_installMutex; hooks are queued).
+static void InstallShadowHooks(ID3D12Device* dev)
+{
+    D3D12_RESOURCE_DESC rd = BufferDesc(65536);
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    ID3D12Resource* up = nullptr; ID3D12Resource* def = nullptr; ID3D12Heap* heap = nullptr;
+    dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&up));
+    D3D12_HEAP_DESC hd = {};
+    hd.SizeInBytes = 65536; hd.Alignment = 65536;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    if (SUCCEEDED(dev->CreateHeap(&hd, IID_PPV_ARGS(&heap))) && heap)
+        dev->CreatePlacedResource(heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&def));
+    void** v0 = up ? *reinterpret_cast<void***>(up) : nullptr;
+    void** v1 = def ? *reinterpret_cast<void***>(def) : nullptr;
+    if (v0) InstallResVT<0>(v0, nullptr);
+    if (v1) InstallResVT<1>(v1, v0);
+    if (v0 && !v1) Log("shadow: temporary DEFAULT buffer failed, only the UPLOAD buffer class is hooked");
+    if (heap) HookVT(*reinterpret_cast<void***>(heap), g_vtbl.Heap_GetDesc, (void*)&Hook_HeapGetDesc, (void**)&o_HeapGetDesc, "Heap::GetDesc");
+    if (v0) {
+        g_mapTarget.store(v0[g_vtbl.Resource_Map], std::memory_order_relaxed);
+        g_resHooksInstalled.store(true, std::memory_order_release);
+    }
+    if (up) up->Release();
+    if (def) def->Release();
+    if (heap) heap->Release();
 }
 
 static void InstallResourceHooks(ID3D12Resource* res)
@@ -2249,7 +2671,7 @@ static void InstallResourceHooks(ID3D12Resource* res)
     }
     std::lock_guard<std::recursive_mutex> lk(g_installMutex);
     if (g_resHooksInstalled.load()) return;
-    HookTarget(target, (void*)&Hook_Map, (void**)&o_Map, "Resource::Map");
+    HookTarget(target, (void*)&ResHooks<0>::Map, (void**)&ResHooks<0>::oMap, "Resource::Map");
     ApplyHooks();
     g_mapTarget.store(target, std::memory_order_relaxed);
     g_resHooksInstalled.store(true, std::memory_order_release);
@@ -2773,6 +3195,7 @@ template <int V> struct QueueHooks {
         if (t_inFix) { oECL(q, n, l); return; } // our own COPY queue submission
         QueueStats* qs = OnExecuteCommandLists(q, n);
         const bool game = t_presentDepth == 0;
+        if (game && g_shTable.load(std::memory_order_relaxed)) ShadowSync(q); // stage 2e: before anything else
         const int64_t t0 = Qpc();
         const bool fix = g_cfg.constPages || g_cfg.gpuTiming || g_hybTable.load(std::memory_order_relaxed);
         if (!(game && fix && qs->desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT && InjectExecute(qs, q, n, l, oECL)))
@@ -3100,8 +3523,30 @@ struct StatsState {
     uint64_t prevFixInj = 0, prevFixRegions = 0, prevFixBytes = 0;
     uint64_t prevHybInj = 0, prevHybRegions = 0, prevHybBytes = 0, prevHybSrvQ = 0, prevHybSrvQB = 0;
     uint64_t prevHybUnion = 0, prevHybRecopy = 0, prevHybAsync = 0;
+    uint64_t prevShSyncs = 0, prevShCopy = 0, prevShDirty = 0, prevShRegions = 0, prevShGww = 0, prevShWaits = 0, prevShBytes = 0;
     std::map<DWORD, uint64_t> prevThreadCpu; // thread id -> user+kernel time (100 ns)
 };
+
+// Stage 2e state, both modes.
+static void AppendShadowStats(std::string& s, StatsState& st, double div, const char* per)
+{
+    if (!g_cfg.shadowHeaps) return;
+    if (!g_shOn.load()) { Appendf(s, "  fix Shadow: OFF (%s)\n", g_shOffReason); return; }
+    const uint64_t sy = g_shSyncs.load(), cp = g_shSyncsCopy.load(), di = g_shDirtyBytes.load(), rg = g_shRegions.load();
+    const uint64_t gw = g_shGwwTicks.load(), wa = g_shWaits.load(), cb = g_shCopyBytes.load();
+    const double gwMs = (gw - st.prevShGww) * 1000.0 / (double)g_qpf.QuadPart;
+    Appendf(s, "  fix Shadow: ON | heaps %llu (%.0f MB) | syncs%s %.1f (with copies %.1f), dirty %.2f MB (copied %.2f MB),"
+               " regions %.1f, GetWriteWatch %.3f ms, queue waits %.1f",
+            g_shHeaps.load(), MB(g_shLiveBytes.load()), per,
+            (sy - st.prevShSyncs) / div, (cp - st.prevShCopy) / div, MB(di - st.prevShDirty) / div, MB(cb - st.prevShBytes) / div,
+            (rg - st.prevShRegions) / div, gwMs / div, (wa - st.prevShWaits) / div);
+    st.prevShSyncs = sy; st.prevShCopy = cp; st.prevShDirty = di; st.prevShRegions = rg; st.prevShGww = gw;
+    st.prevShWaits = wa; st.prevShBytes = cb;
+    if (g_shFailed.load()) Appendf(s, " | heap creation failed %llu", g_shFailed.load());
+    if (g_shCopyFail.load()) Appendf(s, " | COPY SUBMISSION FAILURES %llu", g_shCopyFail.load());
+    if (g_cfg.shadowNoCopy) Appendf(s, " | TEST: COPIES DISABLED");
+    Appendf(s, "\n");
+}
 
 // Stage 2d state, both modes.
 static void AppendHybStats(std::string& s, StatsState& st, const uint64_t* dMisc, double div, const char* per)
@@ -3253,6 +3698,7 @@ static void DumpStats(StatsState& st)
                     MB(g_vidLiveBytes.load()), g_vidHeaps.load(), g_vidBufs.load(),
                     g_vidNoRoom.load(), g_vidFailed.load(), g_vidIgnored.load());
         AppendHybStats(s, st, dMisc, div, per);
+        AppendShadowStats(s, st, div, per);
         AppendThreadCpu(s, st, div, per);
         LogRaw(s.c_str());
         return;
@@ -3284,6 +3730,7 @@ static void DumpStats(StatsState& st)
                 g_vidBufs.load(), MB(g_vidBufBytes.load()), g_vidUnverified.load(), g_vidNoRoom.load(), g_vidFailed.load(),
                 g_vidIgnored.load());
     AppendHybStats(s, st, dMisc, div, per);
+    AppendShadowStats(s, st, div, per);
 
     if (g_cfg.gpuTiming) {
         GpuAgg g;
@@ -3656,7 +4103,7 @@ static void CheckListVtable(ID3D12GraphicsCommandList* cl)
 // Temporary queues and command lists, only to reach their vtables and hook
 // ExecuteCommandLists and the command list methods (caller holds g_installMutex;
 // hooks are queued, not enabled yet, so these creations are not recorded).
-static void InstallQueueAndListHooks(ID3D12Device* dev)
+static void InstallQueueAndListHooks(ID3D12Device* dev, bool lists = true)
 {
     static const D3D12_COMMAND_LIST_TYPE kQueueTypes[] = {
         D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY };
@@ -3669,6 +4116,7 @@ static void InstallQueueAndListHooks(ID3D12Device* dev)
         InstallForType<QueueHooks>(i, *reinterpret_cast<void***>(q), ListTypeName(qd.Type));
         q->Release();
     }
+    if (!lists) return;
     static const D3D12_COMMAND_LIST_TYPE kListTypes[] = {
         D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY,
         D3D12_COMMAND_LIST_TYPE_BUNDLE };
@@ -3700,7 +4148,8 @@ static void InstallDeviceHooks(ID3D12Device* dev)
         // Fix-only mode ([General] Measure=0): just the calls stage 2c / 2d need.
         Log("installing device hooks (fix-only mode: no measurement%s)",
             g_cfg.hybridHeaps ? "; stage 2d: placed resources, SRVs, VB/IB, list Reset/Close, ExecuteCommandLists"
-                              : ": no binding/draw/submit hooks");
+            : g_cfg.shadowHeaps ? "; stage 2e: Map/Unmap, GetHeapProperties, Heap::GetDesc, ExecuteCommandLists"
+                                : ": no binding/draw/submit hooks");
         HookVT(vt, g_vtbl.Device_CreateCommittedResource, (void*)&Hook_CCR, (void**)&o_CCR, "Device::CreateCommittedResource");
         HookVT(vt, g_vtbl.Device_CreateHeap, (void*)&Hook_CH, (void**)&o_CH, "Device::CreateHeap");
         if (g_cfg.hybridHeaps) {
@@ -3731,7 +4180,10 @@ static void InstallDeviceHooks(ID3D12Device* dev)
                 m10->Release();
             }
             InstallQueueAndListHooks(dev);
+        } else if (g_cfg.shadowHeaps) {
+            InstallQueueAndListHooks(dev, false); // stage 2e needs ExecuteCommandLists only
         }
+        if (g_cfg.shadowHeaps) InstallShadowHooks(dev);
         ApplyHooks();
         Log("device hooks installed");
         return;
@@ -3765,6 +4217,7 @@ static void InstallDeviceHooks(ID3D12Device* dev)
         d10->Release();
     }
     InstallQueueAndListHooks(dev);
+    if (g_cfg.shadowHeaps) InstallShadowHooks(dev);
     ApplyHooks();
     Log("device hooks installed");
 }

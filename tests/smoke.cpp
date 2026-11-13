@@ -787,7 +787,7 @@ int wmain(int argc, wchar_t** argv)
         const bool hybSrv = hyb && iniInt(L"Fix", L"HybridSrv", 0);
         const bool hybCheck = hyb && measure && iniInt(L"Fix", L"HybridCheck", 0);
         const bool noCopy = hyb && iniInt(L"Fix", L"HybridTestNoCopy", 0);
-        const bool expectPStale = hybSrv && !hybCheck && !noCopy;
+        const bool expectPStale = hybSrv && !hybCheck && !noCopy && !iniInt(L"Fix", L"ShadowHeaps", 0); // stage 2e reads fresh data
         printf("phase 4: ini says hybrid %d, SRV %d, check %d, no-copy test %d -> persistent buffer %s\n",
                hyb, hybSrv, hybCheck, noCopy, expectPStale ? "MUST read stale data" : "must read fresh data");
 

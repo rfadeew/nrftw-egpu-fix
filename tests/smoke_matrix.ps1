@@ -25,9 +25,14 @@ $runs = @(
     @{ n = "m1_hyb_check";    e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridCheck = 1 } },
     @{ n = "m1_hyb_check_cq"; e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridCheck = 1; HybridCopyQueue = 1 } },
     @{ n = "m1_consts";       e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; ConstPages = 1 } },
+    @{ n = "m0_shadow";       e = "pass"; a = "";      o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 1; HybridSrv = 1; ShadowHeaps = 1 } },
+    @{ n = "m1_shadow";       e = "pass"; a = "";      o = @{ Measure = 1; VidmemHeaps = 1; HybridHeaps = 1; HybridSrv = 1; ShadowHeaps = 1 } },
+    @{ n = "m0_shadow_gap0";  e = "pass"; a = "";      o = @{ Measure = 0; ShadowHeaps = 1; ShadowMergeKB = 0 } },
     @{ n = "neg_break";       e = "fail"; a = "break"; o = @{ Measure = 0; VidmemHeaps = 1; HybridHeaps = 0 } },
     @{ n = "neg_hyb_nocopy";  e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridTestNoCopy = 1 } },
     @{ n = "neg_srv_1copy";   e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridSrvCopies = 1 } },
+    @{ n = "neg_shadow_break"; e = "fail"; a = "break"; o = @{ Measure = 0; ShadowHeaps = 1 } },
+    @{ n = "neg_shadow_nocopy"; e = "fail"; a = "";     o = @{ Measure = 0; ShadowHeaps = 1; ShadowTestNoCopy = 1 } },
     @{ n = "neg_cq_1copy";    e = "fail"; a = "";      o = @{ Measure = 0; VidmemHeaps = 0; HybridHeaps = 1; HybridSrv = 1; HybridSrvCopies = 1; HybridCopyQueue = 1 } }
 )
 

@@ -111,6 +111,12 @@ static void ReadConfig(const wchar_t* ini)
     g_cfg.hybridCopyQueue  = IniBool(L"Fix", L"HybridCopyQueue", d.hybridCopyQueue, ini);
     g_cfg.hybridCheck      = IniBool(L"Fix", L"HybridCheck", d.hybridCheck, ini);
     g_cfg.hybridNoCopy     = IniBool(L"Fix", L"HybridTestNoCopy", d.hybridNoCopy, ini);
+    g_cfg.shadowHeaps      = IniBool(L"Fix", L"ShadowHeaps", d.shadowHeaps, ini);
+    g_cfg.shadowMergeKB    = IniInt(L"Fix", L"ShadowMergeKB", d.shadowMergeKB, ini);
+    g_cfg.shadowNoCopy     = IniBool(L"Fix", L"ShadowTestNoCopy", d.shadowNoCopy, ini);
+    if (g_cfg.shadowMergeKB < 0) g_cfg.shadowMergeKB = 0;
+    if (g_cfg.shadowMergeKB > 1024) g_cfg.shadowMergeKB = 1024;
+    if (!g_cfg.shadowHeaps) g_cfg.shadowNoCopy = false;
     if (g_cfg.vidmemReserveMB < 0) g_cfg.vidmemReserveMB = 0;
     if (g_cfg.vidmemCapMB < 0) g_cfg.vidmemCapMB = 0;
     if (g_cfg.hybridSrvCopies < 1) g_cfg.hybridSrvCopies = 1;
@@ -205,12 +211,13 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
     ReadConfig(iniPath);
     Log("config: Hooks=%d Measure=%d IntervalSec=%d VidmemHeaps=%d VidmemBuffers=%d VidmemBufMaxKB=%d VidmemReserveMB=%d"
         " VidmemCapMB=%d VidmemWithReBAR=%d | HybridHeaps=%d HybridSrv=%d HybridSrvCopies=%d HybridMergeKB=%d"
-        " HybridCopyQueue=%d HybridCheck=%d%s"
+        " HybridCopyQueue=%d HybridCheck=%d%s | ShadowHeaps=%d ShadowMergeKB=%d%s"
         " | GpuTiming=%d KmtStats=%d LogCreateLimit=%d TopN=%d ConstPages=%d CbvPad=%d LoadPix=%d (ini %s)",
         g_cfg.hooks, g_cfg.measure, g_cfg.statsIntervalSec, g_cfg.vidmemHeaps, g_cfg.vidmemBuffers, g_cfg.vidmemBufMaxKB,
         g_cfg.vidmemReserveMB, g_cfg.vidmemCapMB, g_cfg.vidmemWithReBAR, g_cfg.hybridHeaps, g_cfg.hybridSrv,
         g_cfg.hybridSrvCopies, g_cfg.hybridMergeKB, g_cfg.hybridCopyQueue, g_cfg.hybridCheck,
         g_cfg.hybridNoCopy ? " HybridTestNoCopy=1 (TEST: no copies)" : "",
+        g_cfg.shadowHeaps, g_cfg.shadowMergeKB, g_cfg.shadowNoCopy ? " ShadowTestNoCopy=1 (TEST: no copies)" : "",
         g_cfg.gpuTiming, g_cfg.kmtStats, g_cfg.logCreateLimit, g_cfg.topN, g_cfg.constPages, g_cfg.cbvPad, g_cfg.loadPix,
         GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES ? "found" : "missing, defaults");
 

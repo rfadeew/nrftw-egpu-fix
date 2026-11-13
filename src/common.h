@@ -35,6 +35,9 @@ struct Config {
     bool hybridCopyQueue  = false; // [Fix] HybridCopyQueue: copies on our own COPY queue, overlapping the game's rendering
     bool hybridCheck      = false; // [Fix] HybridCheck: hash mirrored buffers, count/repair stale mirror data (Measure=1 only)
     bool hybridNoCopy     = false; // [Fix] HybridTestNoCopy: redirect but never copy (negative test, must break rendering)
+    bool shadowHeaps      = false; // [Fix] ShadowHeaps: UPLOAD heaps live in VRAM, CPU writes go to a sysmem shadow (stage 2e)
+    int  shadowMergeKB    = 16;    // [Fix] ShadowMergeKB: dirty ranges closer than this are merged into one copy
+    bool shadowNoCopy     = false; // [Fix] ShadowTestNoCopy: never copy shadow -> VRAM (negative test, must break rendering)
 };
 extern Config g_cfg;
 

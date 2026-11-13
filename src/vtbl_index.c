@@ -41,6 +41,10 @@ const VtblIndex g_vtbl = {
     IDX(ID3D12GraphicsCommandListVtbl, ExecuteIndirect),
 
     IDX(ID3D12ResourceVtbl, Map),
+    IDX(ID3D12ResourceVtbl, Unmap),
+    IDX(ID3D12ResourceVtbl, GetHeapProperties),
+
+    IDX(ID3D12HeapVtbl, GetDesc),
 
     IDX(IDXGIFactoryVtbl, CreateSwapChain),
     IDX(IDXGIFactory2Vtbl, CreateSwapChainForHwnd),

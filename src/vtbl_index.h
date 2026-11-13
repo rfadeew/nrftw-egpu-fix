@@ -45,6 +45,11 @@ typedef struct VtblIndex {
 
     // ID3D12Resource
     int Resource_Map;
+    int Resource_Unmap;
+    int Resource_GetHeapProperties;
+
+    // ID3D12Heap
+    int Heap_GetDesc;
 
     // DXGI
     int Factory_CreateSwapChain;
