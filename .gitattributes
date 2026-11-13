@@ -1,0 +1,8 @@
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ini text eol=crlf
+*.txt text eol=crlf
+*.rc text eol=crlf
+*.wpix binary
+*.sh text eol=lf

@@ -1,0 +1,21 @@
+# Build output and release packages
+build/
+dist/
+*.obj
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.res
+
+# Local runs, captures and private notes (contain local paths)
+logs/
+old/
+*.wpix
+handoff_*.md
+egpu_proxy*.log
+
+# Editor / tool state
+.vs/
+.vscode/
+.claude/

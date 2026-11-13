@@ -1,0 +1,32 @@
+// Version resource of the proxy DLL (shown in Explorer -> Properties -> Details).
+#include <winver.h>
+#include "egpu_version.h"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    EGPU_FIX_VERSION_MAJOR, EGPU_FIX_VERSION_MINOR, EGPU_FIX_VERSION_PATCH, 0
+ PRODUCTVERSION EGPU_FIX_VERSION_MAJOR, EGPU_FIX_VERSION_MINOR, EGPU_FIX_VERSION_PATCH, 0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      VS_FF_PRERELEASE
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_DLL
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "rfadeew"
+            VALUE "FileDescription",  "No Rest for the Wicked eGPU Fix (version.dll proxy)"
+            VALUE "FileVersion",      EGPU_FIX_VERSION_STR
+            VALUE "InternalName",     "egpu_fix"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 rfadeew. MIT License."
+            VALUE "OriginalFilename", "version.dll"
+            VALUE "ProductName",      "No Rest for the Wicked eGPU Fix"
+            VALUE "ProductVersion",   EGPU_FIX_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
