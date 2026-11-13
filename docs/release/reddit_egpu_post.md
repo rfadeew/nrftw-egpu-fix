@@ -25,6 +25,8 @@ NVIDIA only, looking for testers with other setups.
 
 - The game (Unity, D3D12) binds 4 MB `UPLOAD` constant pages as root CBVs. It also places about 150 per-frame
   VB/SRV buffers per frame into a 32 MB `UPLOAD` heap. The GPU reads all of it from system memory.
+- Moving the constant pages to VRAM copies (a first attempt) changed nothing measurable. The per-frame VB/SRV heap
+  was the bottleneck.
 - Measured vertex fetch from sysmem over TB4: about 1.1 GB/s. At the worst spot the GPU was busy 73 ms per frame,
   mostly waiting on those reads. The 5070 Ti eGPU was slower there than the laptop's internal 3060, which has
   ReBAR.

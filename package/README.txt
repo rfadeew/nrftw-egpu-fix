@@ -12,6 +12,8 @@ INSTALL
   3. Start the game normally.
   Check: egpu_proxy.log in the game folder should contain
   "vidmem: stage 2c ON" and "-> VRAM" lines.
+  MelonLoader users: MelonLoader also uses version.dll. Do not overwrite
+  it; rename MelonLoader's version.dll to winhttp.dll first (untested).
 
 UNINSTALL
   Delete version.dll and egpu_fix.ini (and egpu_proxy*.log) from the game folder.

@@ -61,6 +61,12 @@ Every few seconds there is a stats line with FPS and a `fix Vidmem: ON | live in
 Delete `version.dll` and `egpu_fix.ini` from the game folder. You can also delete `egpu_proxy.log` and
 `egpu_proxy.prev.log`. Nothing else is changed.
 
+### MelonLoader and other `version.dll` mods
+
+[MelonLoader](https://github.com/LavaGang/MelonLoader) also installs a `version.dll` in the game folder. Do not
+overwrite it. Rename MelonLoader's `version.dll` to `winhttp.dll` first (MelonLoader supports that name), then
+copy this fix's files. This combination has not been tested yet; please report how it goes.
+
 If a game update ever ships its own `version.dll` in the game folder, do not overwrite it. Open an issue instead.
 
 ## Settings (`egpu_fix.ini`)

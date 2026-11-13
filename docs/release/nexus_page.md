@@ -34,6 +34,83 @@ File description: "Public beta. Copy version.dll and egpu_fix.ini into the game 
 - Permissions: see the "Permissions and credits" section below.
 - Requirements: no other mods are needed. Do not list MelonLoader.
 
+## Upload form fields (plain text)
+
+Paste each block into the field with the same name. If a field accepts formatting, the BBCode description further
+below can be used instead.
+
+### Description
+
+```
+Makes No Rest for the Wicked much faster on NVIDIA eGPUs without Resizable BAR (Thunderbolt / USB4 enclosures).
+
+Over Thunderbolt without ReBAR the GPU waits for most of every frame: the game makes it read per-frame vertex and shader data directly from system memory, across the slow link. This mod is a small version.dll proxy. It asks the NVIDIA driver (NVAPI) to put that data into the part of VRAM the CPU can reach even without ReBAR, so the GPU reads it locally. Game files are not modified.
+
+Results on the test system (i7-12700H laptop, Thunderbolt 4, RTX 5070 Ti eGPU without ReBAR, driver 617.42, Windows 11 25H2), same session, same spots:
+- Worst spot: 13.7 FPS -> 42 FPS (GPU busy time per frame 73 ms -> 7 ms)
+- Lighter spot: 29 FPS -> 50-59 FPS (60 FPS cap)
+Measured with the mod's own GPU timing. Your results will differ.
+
+PUBLIC BETA: tested on one system, including a 1-hour play session. Known limitations:
+- CPU writes into the VRAM window are slow, so heavy scenes can become CPU-limited instead of GPU-limited.
+- Only 160-192 MB of the 256 MB window is usable. Data that does not fit stays in system memory, as without the mod.
+- Online co-op and sessions longer than an hour are not tested yet. The game has no anti-cheat (Steam build 22928553), and the mod does not touch game logic, saves or network traffic. Still, use it online at your own risk.
+- If the game crashes, remove the mod and retry before reporting the crash to Moon Studios.
+
+To report a problem, attach egpu_proxy.log from the game folder (it contains no user names or paths) and list your GPU, enclosure, link and CPU. For performance problems, set Measure=1 in egpu_fix.ini first.
+
+Source code (MIT) and technical details: GITHUB_URL
+```
+
+### Installation instructions
+
+```
+1. Open the game folder: in Steam, right-click the game -> Manage -> Browse local files (the folder with NoRestForTheWicked.exe).
+2. Copy version.dll and egpu_fix.ini from the archive into that folder.
+3. Start the game normally. No launcher or loader is needed.
+4. Optional check: egpu_proxy.log appears in the game folder and contains "vidmem: stage 2c ON" and "-> VRAM" lines.
+
+Using MelonLoader? It also installs a version.dll. Do not overwrite it: rename MelonLoader's version.dll to winhttp.dll first (MelonLoader supports that name), then copy this mod's files. This combination is not tested yet.
+
+Uninstall: delete version.dll and egpu_fix.ini (and egpu_proxy.log, egpu_proxy.prev.log) from the game folder.
+Update: overwrite both files with the new version.
+```
+
+### Main features
+
+```
+- Moves the game's per-frame upload heaps into the GPU's CPU-visible VRAM window (BAR1) through NVIDIA's NVAPI. On the test system: worst spot 13.7 -> 42 FPS.
+- Turns itself off on GPUs with Resizable BAR, on AMD and Intel GPUs, and when NVAPI is missing. The DLL then only passes calls through.
+- Notices when the VRAM window is full and leaves the remaining heaps exactly as the game made them.
+- Does not change game files, shaders, saves or network traffic. The rendered image is the same.
+- Writes egpu_proxy.log with FPS and fix status. Measure=1 adds detailed GPU timing for bug reports. The log contains no user names or folder paths.
+- Four settings in a commented egpu_fix.ini. To uninstall, delete two files.
+- Open source (MIT).
+```
+
+### Requirements
+
+```
+- NVIDIA GPU without Resizable BAR, typically an eGPU over Thunderbolt 3/4/5 or USB4. On other GPUs the mod does nothing.
+- Windows 10/11 64-bit with a current NVIDIA driver (tested: Windows 11 25H2, driver 617.42).
+- Steam version of the game (tested: build 22928553).
+- No other mods needed. MelonLoader is NOT required. If you use it, rename its version.dll to winhttp.dll (see Installation).
+```
+
+### Describe how AI was used
+
+Check this text and correct anything that does not match what you did yourself.
+
+```
+This mod was developed with Claude Code (Anthropic's AI coding assistant).
+
+The AI wrote most of the C++ code: the version.dll proxy, the D3D12 hooks, the NVAPI integration, the logging and statistics, and the standalone D3D12 test program. It also helped analyse the logs and captures, and drafted the README and this page.
+
+My part: I found and reproduced the problem on my own eGPU setup. I ran the diagnostics (nvidia-smi, PIX timing and GPU captures) and tested every build in the game. I decided what to try next and checked the results. Every performance number on this page comes from real runs on my hardware, measured by the mod's own logging, and I keep those logs.
+
+Before a build goes into the game, an automated test renders with it and checks the results by reading them back, including a negative test that must fail. The source code is public (MIT), so anyone can review it: GITHUB_URL
+```
+
 ## Description (BBCode)
 
 ```bbcode
@@ -72,6 +149,8 @@ To check ReBAR: NVIDIA Control Panel -> System Information -> Resizable BAR.
 [*]Start the game normally.
 [/list]
 To check that it works, open [b]egpu_proxy.log[/b] in the game folder. It should contain "vidmem: stage 2c ON" and "-> VRAM" lines.
+
+[b]Using MelonLoader?[/b] It also installs a version.dll. Do not overwrite it: rename MelonLoader's version.dll to winhttp.dll first (MelonLoader supports that name), then copy this mod's files. This combination is not tested yet.
 
 [size=4][b]Uninstallation[/b][/size]
 Delete [b]version.dll[/b] and [b]egpu_fix.ini[/b] (and egpu_proxy*.log) from the game folder.

@@ -29,6 +29,9 @@ window (BAR1) through NVAPI, so the GPU reads them from its own VRAM. Game files
    *Browse local files*).
 3. Start the game. `egpu_proxy.log` in the game folder should contain `vidmem: stage 2c ON` and `-> VRAM` lines.
 
+MelonLoader also installs a `version.dll`. Do not overwrite it: rename MelonLoader's `version.dll` to
+`winhttp.dll` first, then copy this fix's files. This combination is not tested yet.
+
 ## Uninstall
 
 Delete `version.dll` and `egpu_fix.ini` (and `egpu_proxy*.log`) from the game folder.

@@ -34,6 +34,7 @@ i7-12700H laptop with a TB4 port, RTX 5070 Ti eGPU (no ReBAR), driver 617.42, Wi
 [list]
 [*]Install: copy version.dll and egpu_fix.ini into the game folder (Steam → right-click the game → Manage → Browse local files).
 [*]Uninstall: delete version.dll and egpu_fix.ini.
+[*]MelonLoader users: MelonLoader also uses version.dll. Rename its version.dll to winhttp.dll first (untested combination).
 [/list]
 
 [h2]Known limitations[/h2]
