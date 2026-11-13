@@ -28,6 +28,13 @@ struct Config {
     int  vidmemReserveMB  = 32;    // [Fix] VidmemReserveMB: CPU-visible VRAM always left free (if the driver reports it)
     int  vidmemCapMB      = 192;   // [Fix] VidmemCapMB: max of our live CPU-visible VRAM (window ~192 MB free on this system)
     bool vidmemWithReBAR  = false; // [Fix] VidmemWithReBAR: also run stage 2c when the GPU has ReBAR (untested)
+    bool hybridHeaps      = false; // [Fix] HybridHeaps: UPLOAD heaps not placed in VRAM by 2c get a DEFAULT mirror (stage 2d)
+    bool hybridSrv        = false; // [Fix] HybridSrv: also redirect buffer SRV descriptors into the mirror
+    int  hybridSrvCopies  = 2;     // [Fix] HybridSrvCopies: game submissions at which a new SRV's range is copied
+    int  hybridMergeKB    = 16;    // [Fix] HybridMergeKB: copy ranges closer than this are merged into one copy
+    bool hybridCopyQueue  = false; // [Fix] HybridCopyQueue: copies on our own COPY queue, overlapping the game's rendering
+    bool hybridCheck      = false; // [Fix] HybridCheck: hash mirrored buffers, count/repair stale mirror data (Measure=1 only)
+    bool hybridNoCopy     = false; // [Fix] HybridTestNoCopy: redirect but never copy (negative test, must break rendering)
 };
 extern Config g_cfg;
 

@@ -28,6 +28,11 @@
 // buffers are created through NVAPI in CPU-visible VRAM (the 256 MB BAR1
 // window), so the GPU reads them from VRAM. Only on an NVIDIA GPU without
 // ReBAR (it switches itself off otherwise). See the "Stage 2c" section below.
+//
+// Stage 2d ([Fix] HybridHeaps / HybridSrv / HybridCheck): UPLOAD heaps that
+// stage 2c did not place in VRAM stay in system memory and get a DEFAULT-heap
+// mirror; VB/IB views (and optionally buffer SRVs) are redirected into it and
+// the referenced ranges are copied at ExecuteCommandLists. See "Stage 2d".
 
 #include "common.h"
 #include <d3d12.h>
@@ -44,6 +49,7 @@
 #include <vector>
 #include <stdio.h>
 #include <stdarg.h>
+#include <smmintrin.h>
 
 #include "vtbl_index.h"
 
@@ -256,6 +262,12 @@ enum Misc : int {
     M_MAP,
     M_FIX_REDIRECT, // stage 2a: root CBV binds redirected to a twin
     M_FIX_SKIP,     // stage 2a: root CBV binds into a twinned page left on sysmem (list not tracked)
+    M_HYB_VB,       // stage 2d: vertex buffer views redirected into a heap mirror
+    M_HYB_IB,       // stage 2d: index buffer views redirected
+    M_HYB_SKIP,     // stage 2d: VB/IB binds into a mirrored heap left on sysmem (list not tracked)
+    M_HYB_SRV_ALIAS,// stage 2d: buffer SRVs redirected to the mirror's whole-heap buffer (FirstElement shifted)
+    M_HYB_SRV_TWIN, // stage 2d: buffer SRVs redirected to a per-buffer twin placed in the mirror
+    M_HYB_SRV_SKIP, // stage 2d: SRVs on mirrored buffers left on sysmem (no desc, not a buffer view, twin failed)
     M_COUNT
 };
 
@@ -293,6 +305,8 @@ static inline void Bump(std::atomic<uint64_t>& a, uint64_t n = 1)
 }
 
 // ---- Buffer records -----------------------------------------------------------
+struct HybHeap; // stage 2d
+
 struct ResRec {
     uint64_t id = 0;
     ID3D12Resource* res = nullptr;   // not AddRef'd; valid while alive
@@ -317,6 +331,13 @@ struct ResRec {
     ID3D12Resource* twin = nullptr;
     uint64_t twinVA = 0;
     bool twinDead = false;
+    // Stage 2d: placed in a mirrored UPLOAD heap (set before registration).
+    HybHeap* hh = nullptr;
+    // HybridCheck state (guarded by g_fixMutex, except hcSrv)
+    std::atomic<bool> hcSrv{false};  // an SRV on it was redirected into the mirror
+    bool hcTracked = false;          // in g_hcList: hashed at its last copy, re-checked at later submissions
+    uint64_t hcHash = 0, hcCopyEcl = 0;
+    uint32_t hcChanges = 0;
     ResRec() { for (auto& a : use) a.store(0, std::memory_order_relaxed); }
 };
 
@@ -354,10 +375,12 @@ static void RegisterRec(ResRec* r)
 }
 
 static void FixOnPageDestroyed(ResRec* r); // stage 2a
+static void HcOnDestroyed(ResRec* r);       // stage 2d HybridCheck
 
 static void OnResourceDestroyed(ResRec* r)
 {
     if (r->twin) FixOnPageDestroyed(r);
+    if (r->hh && g_cfg.hybridCheck) HcOnDestroyed(r);
     r->alive.store(false, std::memory_order_relaxed);
     AcquireSRWLockExclusive(&g_resLock);
     auto it = g_byVa.find(r->va);
@@ -594,7 +617,85 @@ static thread_local int t_inFix = 0;            // > 0 while recording our own c
 static std::atomic<uint64_t> g_fixTwinsLive{0}, g_fixTwinsTotal{0};
 static std::atomic<uint64_t> g_fixInjections{0}, g_fixCopyRegions{0}, g_fixCopyBytes{0}, g_fixFailures{0};
 
-struct ListRange { ResRec* rec; uint64_t lo, hi; };
+// Byte range [lo, hi) of a constant page (2a) or of a mirrored heap (2d).
+template <class K> struct KRange { K* k; uint64_t lo, hi; };
+using ListRange = KRange<ResRec>;
+using HybRange = KRange<HybHeap>;
+
+static inline bool NearRange(uint64_t elo, uint64_t ehi, uint64_t lo, uint64_t hi, uint64_t gap)
+{
+    return lo <= ehi + gap && hi + gap >= elo;
+}
+
+// Adds a range to a list's set: extends a recent entry of the same key if within
+// gap, else appends. Bounded search (allocations are mostly sequential);
+// ExecuteCommandLists sorts and merges everything anyway.
+template <class K>
+static void AddRange(std::vector<KRange<K>>& v, size_t& last, K* k, uint64_t lo, uint64_t hi, uint64_t gap)
+{
+    if (last < v.size()) {
+        KRange<K>& e = v[last];
+        if (e.k == k && NearRange(e.lo, e.hi, lo, hi, gap)) {
+            if (lo < e.lo) e.lo = lo;
+            if (hi > e.hi) e.hi = hi;
+            return;
+        }
+    }
+    const size_t n = v.size(), from = n > 16 ? n - 16 : 0;
+    for (size_t i = n; i-- > from;) {
+        KRange<K>& e = v[i];
+        if (e.k == k && NearRange(e.lo, e.hi, lo, hi, gap)) {
+            if (lo < e.lo) e.lo = lo;
+            if (hi > e.hi) e.hi = hi;
+            last = i;
+            return;
+        }
+    }
+    v.push_back({ k, lo, hi });
+    last = v.size() - 1;
+}
+
+// Sorts by (key, lo) and merges ranges closer than gap, in place. Returns the
+// exact union of the input in bytes (before gap filling).
+template <class K>
+static uint64_t MergeRanges(std::vector<KRange<K>>& v, uint64_t gap = kMergeGap)
+{
+    if (v.empty()) return 0;
+    std::sort(v.begin(), v.end(), [](const KRange<K>& a, const KRange<K>& b) {
+        return a.k != b.k ? a.k < b.k : a.lo < b.lo;
+    });
+    uint64_t uni = 0, ulo = v[0].lo, uhi = v[0].hi;
+    const K* uk = v[0].k;
+    size_t o = 0;
+    for (size_t i = 1; i < v.size(); ++i) {
+        const KRange<K> r = v[i];
+        if (r.k == uk && r.lo <= uhi) { if (r.hi > uhi) uhi = r.hi; }
+        else { uni += uhi - ulo; uk = r.k; ulo = r.lo; uhi = r.hi; }
+        KRange<K>& e = v[o];
+        if (r.k == e.k && r.lo <= e.hi + gap) { if (r.hi > e.hi) e.hi = r.hi; }
+        else v[++o] = r;
+    }
+    uni += uhi - ulo;
+    v.resize(o + 1);
+    return uni;
+}
+
+// Bytes of a that are also in b (both sorted and merged with gap 0).
+template <class K>
+static uint64_t OverlapBytes(const std::vector<KRange<K>>& a, const std::vector<KRange<K>>& b)
+{
+    uint64_t n = 0;
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        const KRange<K>& x = a[i];
+        const KRange<K>& y = b[j];
+        if (x.k != y.k) { if (x.k < y.k) ++i; else ++j; continue; }
+        const uint64_t lo = x.lo > y.lo ? x.lo : y.lo, hi = x.hi < y.hi ? x.hi : y.hi;
+        if (hi > lo) n += hi - lo;
+        if (x.hi < y.hi) ++i; else ++j;
+    }
+    return n;
+}
 
 // What a command list recorded ([Stats] GpuTiming, to explain its GPU time).
 struct ListCounters {
@@ -610,36 +711,13 @@ struct ListState {
     bool known = false;   // the current recording started with a Reset we saw (cnt is complete)
     bool direct = false;  // D3D12_COMMAND_LIST_TYPE_DIRECT
     ListCounters cnt = {};
-    size_t last = 0;      // ranges[] entry extended last
-    std::vector<ListRange> ranges;
+    size_t last = 0, hlast = 0;     // entries extended last
+    std::vector<ListRange> ranges;  // stage 2a: constant page ranges read through redirected root CBVs
+    std::vector<HybRange> hranges;  // stage 2d: mirrored heap ranges read through redirected VB/IB views
 
-    static bool Near(const ListRange& e, uint64_t lo, uint64_t hi)
-    {
-        return lo <= e.hi + kMergeGap && hi + kMergeGap >= e.lo;
-    }
-    void Add(ResRec* r, uint64_t lo, uint64_t hi)
-    {
-        // Ring allocations are sequential: almost always extends the last entry.
-        if (last < ranges.size()) {
-            ListRange& e = ranges[last];
-            if (e.rec == r && Near(e, lo, hi)) {
-                if (lo < e.lo) e.lo = lo;
-                if (hi > e.hi) e.hi = hi;
-                return;
-            }
-        }
-        for (size_t i = 0; i < ranges.size(); ++i) {
-            ListRange& e = ranges[i];
-            if (e.rec == r && Near(e, lo, hi)) {
-                if (lo < e.lo) e.lo = lo;
-                if (hi > e.hi) e.hi = hi;
-                last = i;
-                return;
-            }
-        }
-        ranges.push_back({ r, lo, hi });
-        last = ranges.size() - 1;
-    }
+    void Add(ResRec* r, uint64_t lo, uint64_t hi) { AddRange(ranges, last, r, lo, hi, kMergeGap); }
+    // Exact (gap 0): the copy merges with [Fix] HybridMergeKB later, the stats need the exact union.
+    void AddH(HybHeap* h, uint64_t lo, uint64_t hi) { AddRange(hranges, hlast, h, lo, hi, 0); }
 };
 
 static SRWLOCK g_listLock = SRWLOCK_INIT;
@@ -674,7 +752,8 @@ static void OnListReset(ID3D12GraphicsCommandList* cl, bool ok)
 {
     ListState* ls = GetOrCreateListState(cl);
     ls->ranges.clear();
-    ls->last = 0;
+    ls->hranges.clear();
+    ls->last = ls->hlast = 0;
     ls->cnt = {};
     ls->direct = cl->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT;
     ls->open = ls->known = ok && t_presentDepth == 0;
@@ -753,6 +832,15 @@ struct FixQueue {
     ID3D12GraphicsCommandList* list = nullptr;  // copy list
     std::vector<FixAlloc> allocs;
     std::vector<ListRange> scratch;
+    std::vector<HybRange> hscratch;
+    std::vector<HybRange> hframe;   // stage 2d: exact ranges referenced by earlier submissions of this frame (stats)
+    uint64_t hframeNo = ~0ull;
+    // Stage 2d with [Fix] HybridCopyQueue: our COPY queue; game submissions wait for its fence.
+    ID3D12CommandQueue* cq = nullptr;
+    ID3D12Fence* cfence = nullptr;
+    uint64_t cSignaled = 0;
+    ID3D12GraphicsCommandList* clist = nullptr;
+    std::vector<FixAlloc> callocs;
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
     std::vector<ID3D12CommandList*> submit;
     // GPU timing
@@ -772,33 +860,39 @@ struct FixQueue {
 };
 static std::vector<FixQueue*> g_fixQueues; // guarded by g_fixMutex
 
-// Twins of dead pages, released once every queue passed the value it had
-// signaled when the page died (guarded by g_fixMutex).
-struct PendingTwin { ID3D12Resource* twin; uint64_t pageId; std::vector<std::pair<FixQueue*, uint64_t>> waits; };
-static std::vector<PendingTwin> g_pendingTwins;
+// Our objects the GPU may still use (twins of dead pages / buffers, retired heap
+// mirrors), released once every queue passed the value it had signaled when
+// they were retired (guarded by g_fixMutex). what == nullptr: not logged.
+struct PendingRelease { IUnknown* obj; uint64_t id; const char* what; std::vector<std::pair<FixQueue*, uint64_t>> waits; };
+static std::vector<PendingRelease> g_pendingRel;
+
+static void DeferRelease(IUnknown* obj, uint64_t id, const char* what) // caller holds g_fixMutex
+{
+    PendingRelease p = { obj, id, what, {} };
+    for (FixQueue* fq : g_fixQueues) p.waits.push_back({ fq, fq->lastSignaled });
+    g_pendingRel.push_back(std::move(p));
+}
 
 static void FixOnPageDestroyed(ResRec* r)
 {
     std::lock_guard<std::mutex> lk(g_fixMutex);
     if (r->twinDead) return;
     r->twinDead = true;
-    PendingTwin p = { r->twin, r->id, {} };
-    for (FixQueue* fq : g_fixQueues) p.waits.push_back({ fq, fq->lastSignaled });
-    g_pendingTwins.push_back(std::move(p));
+    DeferRelease(r->twin, r->id, "twin of dead UPLOAD");
     g_fixTwinsLive.fetch_sub(1, std::memory_order_relaxed);
 }
 
-static void ReleasePendingTwins() // caller holds g_fixMutex
+static void ReleasePending() // caller holds g_fixMutex
 {
-    for (size_t i = 0; i < g_pendingTwins.size();) {
-        PendingTwin& p = g_pendingTwins[i];
+    for (size_t i = 0; i < g_pendingRel.size();) {
+        PendingRelease& p = g_pendingRel[i];
         bool done = true;
         for (auto& w : p.waits) done = done && w.first->fence->GetCompletedValue() >= w.second;
         if (done) {
-            p.twin->Release();
-            Log("fix: released twin of dead UPLOAD #%llu", p.pageId);
-            g_pendingTwins[i] = std::move(g_pendingTwins.back());
-            g_pendingTwins.pop_back();
+            p.obj->Release();
+            if (p.what) Log("fix: released %s #%llu", p.what, p.id);
+            g_pendingRel[i] = std::move(g_pendingRel.back());
+            g_pendingRel.pop_back();
         } else {
             ++i;
         }
@@ -846,7 +940,9 @@ static PFN_CreateCommittedResource CreateCommittedResource;
 // The device vtables live in D3D12Core.dll and are shared by all devices, so the
 // hooks check the adapter LUID of the calling device (VidDevice()).
 static std::atomic<bool> g_vidOn{false};   // set (release) after g_vidLuid / g_vidAdapter / nv:: are ready
-static LUID g_vidLuid = {};
+static std::atomic<bool> g_hybOn{false};   // stage 2d runs for the device g_vidLuid (set after g_vidLuid)
+static const char* g_hybOffReason = "no D3D12 device yet";
+static LUID g_vidLuid = {};                // the device the fixes run for (2c and/or 2d)
 static const char* g_vidOffReason = "no D3D12 device yet"; // for the stats line while g_vidOn is false
 static bool g_nvQueryOk = false;           // QueryCpuVisibleVidmem works (budget from the driver)
 static IDXGIAdapter3* g_vidAdapter = nullptr; // process memory usage checks (kept for the process lifetime)
@@ -915,8 +1011,12 @@ static bool LoadNvapi()
 // everything else is logged once per adapter and left alone.
 static void InitVidmem(ID3D12Device* dev)
 {
-    if (!g_cfg.vidmemHeaps && !g_cfg.vidmemBuffers) { g_vidOffReason = "disabled in egpu_fix.ini"; return; }
-    if (g_vidOn.load()) return; // already running for a device (D3D12 returns the same device per adapter)
+    const bool want2c = g_cfg.vidmemHeaps || g_cfg.vidmemBuffers;
+    if (!want2c) g_vidOffReason = "disabled in egpu_fix.ini";
+    if (!g_cfg.hybridHeaps) g_hybOffReason = "disabled in egpu_fix.ini";
+    if (!want2c && !g_cfg.hybridHeaps) return;
+    // Already running for a device (D3D12 returns the same device per adapter).
+    if (g_vidOn.load() || g_hybOn.load()) return;
     const LUID luid = dev->GetAdapterLuid();
     static std::vector<LUID> seen;
     for (const LUID& l : seen) if (SameLuid(l, luid)) return;
@@ -932,29 +1032,42 @@ static void InitVidmem(ID3D12Device* dev)
         f->EnumAdapterByLuid(luid, IID_PPV_ARGS(&ad));
         f->Release();
     }
+    // The device checks gate both stage 2c and stage 2d.
+    auto off = [&](const char* reason) {
+        if (want2c) g_vidOffReason = reason;
+        if (g_cfg.hybridHeaps) g_hybOffReason = reason;
+        if (ad) ad->Release();
+    };
     DXGI_ADAPTER_DESC1 desc = {};
     if (!ad || FAILED(ad->GetDesc1(&desc))) {
-        Log("vidmem: cannot query the device's adapter, stage 2c off for it");
-        g_vidOffReason = "adapter unknown";
-        if (ad) ad->Release();
+        Log("vidmem: cannot query the device's adapter, the fix is off for it");
+        off("adapter unknown");
         return;
     }
     if (desc.VendorId != 0x10DE) {
-        Log("vidmem: %ls is not an NVIDIA GPU (vendor 0x%04x), stage 2c off for it", desc.Description, desc.VendorId);
-        g_vidOffReason = "not an NVIDIA GPU";
-        ad->Release();
+        Log("vidmem: %ls is not an NVIDIA GPU (vendor 0x%04x), the fix is off for it", desc.Description, desc.VendorId);
+        off("not an NVIDIA GPU");
         return;
     }
     D3D12_FEATURE_DATA_D3D12_OPTIONS16 o16 = {};
     const bool rebar = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &o16, sizeof(o16))) &&
                        o16.GPUUploadHeapSupported;
     if (rebar && !g_cfg.vidmemWithReBAR) {
-        Log("vidmem: %ls has ReBAR (GPUUploadHeapSupported=1), the fix is not needed: stage 2c off for it"
+        Log("vidmem: %ls has ReBAR (GPUUploadHeapSupported=1), the fix is not needed: off for it"
             " ([Fix] VidmemWithReBAR=1 forces it on)", desc.Description);
-        g_vidOffReason = "ReBAR active, not needed";
-        ad->Release();
+        off("ReBAR active, not needed");
         return;
     }
+    g_vidLuid = luid;
+    if (g_cfg.hybridHeaps) {
+        Log("hybrid: stage 2d ON for %ls: UPLOAD heaps not placed in CPU-visible VRAM get a DEFAULT mirror"
+            " (VB/IB redirects; SRV redirects %s, %d copies per new SRV; HybridCheck %s)%s", desc.Description,
+            g_cfg.hybridSrv ? "ON" : "off", g_cfg.hybridSrvCopies, g_cfg.hybridCheck ? "ON" : "off",
+            g_cfg.hybridNoCopy ? " -- TEST MODE: copies disabled, rendering WILL be wrong" : "");
+        g_hybOffReason = "";
+        g_hybOn.store(true, std::memory_order_release);
+    }
+    if (!want2c) { ad->Release(); return; }
     if (!LoadNvapi()) { ad->Release(); return; }
 
     uint64_t total = 0, fr = 0;
@@ -970,7 +1083,6 @@ static void InitVidmem(ID3D12Device* dev)
         desc.Description, rebar ? "on, forced by VidmemWithReBAR" : "off",
         g_cfg.vidmemHeaps ? "ON" : "off", g_cfg.vidmemBuffers ? "ON" : "off", g_cfg.vidmemBufMaxKB);
     g_vidAdapter = ad; // kept for the process lifetime
-    g_vidLuid = luid;
     g_vidOffReason = "";
     g_vidOn.store(true, std::memory_order_release);
 }
@@ -979,6 +1091,12 @@ static void InitVidmem(ID3D12Device* dev)
 static bool VidDevice(ID3D12Device* d)
 {
     return g_vidOn.load(std::memory_order_acquire) && SameLuid(d->GetAdapterLuid(), g_vidLuid);
+}
+
+// Stage 2d applies to this device.
+static bool HybDevice(ID3D12Device* d)
+{
+    return g_hybOn.load(std::memory_order_acquire) && SameLuid(d->GetAdapterLuid(), g_vidLuid);
 }
 
 struct VidSnap { bool nvOk, dxOk; uint64_t nvFree, local, nonLocal; };
@@ -1242,6 +1360,7 @@ struct CreateGuard {
 };
 
 static void CreateTwin(ID3D12Device* dev, ResRec* r); // stage 2a
+static HybHeap* FindHyb(uint64_t va);                 // stage 2d
 
 // dev: only for committed resources (twin creation), nullptr otherwise.
 // vid: committed buffer created in CPU-visible VRAM (stage 2c).
@@ -1277,6 +1396,7 @@ static void OnResourceCreated(ID3D12Device* dev, const char* how, const D3D12_HE
     r->resFlags = (uint32_t)desc->Flags;
     r->initState = initState;
     r->createdFrame = g_frames.load(std::memory_order_relaxed);
+    if (heap && cat == HC_UPLOAD && r->va) r->hh = FindHyb(r->va); // stage 2d
 
     g_bufCreated[cat].fetch_add(1, std::memory_order_relaxed);
     g_bufCreatedBytes[cat].fetch_add(r->size, std::memory_order_relaxed);
@@ -1353,6 +1473,570 @@ static PFN_CCR  o_CCR;  static PFN_CCR1 o_CCR1; static PFN_CCR2 o_CCR2; static P
 static PFN_CPR  o_CPR;  static PFN_CPR1 o_CPR1; static PFN_CPR2 o_CPR2;
 static PFN_CH   o_CH;   static PFN_CH1  o_CH1;
 static PFN_CCBV o_CCBV; static PFN_CSRV o_CSRV;
+
+// ============================================================================
+// Stage 2d: DEFAULT-heap mirrors of the game's UPLOAD heaps ("hybrid")
+// ============================================================================
+// Stage 2c puts UPLOAD heaps into the 256 MB CPU-visible VRAM window: the GPU
+// reads them fast, but CPU writes crawl (~0.8 GB/s over TB4) and only 5-6
+// heaps fit. Here an UPLOAD heap stays in system memory (fast CPU writes) and
+// gets a DEFAULT heap of the same size (VRAM, no size limit); the GPU reads
+// the mirror:
+//   * In both heaps we place one whole-heap buffer at offset 0: "src" in the
+//     game's heap, "dst" in the mirror. A placed buffer's GPU VA is the heap's
+//     base VA + offset (checked for every buffer the game places there), so a
+//     VA inside the game heap maps to dst VA + (va - src VA).
+//   * IASetVertexBuffers / IASetIndexBuffer views into a mirrored heap are
+//     redirected (DIRECT lists whose Reset we saw) and the view's byte range
+//     is recorded in the list's ListState: exact, the view size is known.
+//   * [Fix] HybridSrv: CreateShaderResourceView of a buffer in a mirrored heap
+//     gets the dst buffer with FirstElement shifted by the buffer's heap offset
+//     (when that is a multiple of the element size), else a twin of the buffer
+//     placed at the same offset in the mirror (kept in the buffer's private
+//     data, released with it). Descriptors the game copies around carry the
+//     redirect. Which submission reads an SRV is unknown, so the view's range
+//     is copied at the next HybridSrvCopies game submissions. That is correct
+//     if the game writes the data before then and never rewrites it in place
+//     while the descriptor is in use; [Fix] HybridCheck measures exactly that.
+//   * ExecuteCommandLists on a DIRECT queue (game submissions) prepends our
+//     list: the merged ranges are copied src -> dst, then each dst goes
+//     COPY_DEST -> GENERIC_READ (buffers decay to COMMON after every ECL).
+// Safety: the game's heap stays intact, so whatever we don't redirect (lists
+// whose Reset we missed, bundles, ExecuteIndirect arguments, root CBV/SRV,
+// other queues) still reads correct data from system memory. The only risk is
+// a stale mirror under an SRV. The game reuses heap offsets only after its own
+// fences and our copies run on the same queue before its lists, so earlier
+// submissions are done with old data at an offset before we overwrite it
+// (over-copied neighbour bytes are the current system-memory bytes anyway).
+static constexpr int kMaxHybHeaps = 64;
+
+struct HybHeap {
+    uint64_t id = 0;
+    ID3D12Heap* game = nullptr;      // the game's heap; we hold one public reference to see when the game lets go
+    ID3D12Heap* mirror = nullptr;    // our DEFAULT heap of the same size
+    ID3D12Resource* src = nullptr;   // whole-heap buffer at offset 0 of the game heap (copy source)
+    ID3D12Resource* dst = nullptr;   // whole-heap buffer at offset 0 of the mirror (copy target, SRV alias)
+    uint64_t size = 0, srcVA = 0, dstVA = 0;
+    const uint8_t* cpu = nullptr;    // src mapped (HybridCheck only; guarded by g_fixMutex)
+    std::atomic<bool> bad{false};    // VA layout check failed: no new redirects into this heap
+    bool dead = false;               // retired: the game released the heap (g_fixMutex)
+};
+struct HybTable { int n; HybHeap* h[kMaxHybHeaps]; };
+static std::atomic<const HybTable*> g_hybTable{nullptr}; // immutable snapshots (old ones are leaked: tiny, rare)
+static std::mutex g_hybTableMutex;                       // writers
+static std::atomic<bool> g_hybRedirect{true};            // cleared if the copy path ever fails
+static std::atomic<uint64_t> g_hybHeaps{0}, g_hybLiveBytes{0}, g_hybFailed{0}, g_hybRetired{0}, g_hybBadLayout{0};
+static std::atomic<uint64_t> g_hybInj{0}, g_hybRegions{0}, g_hybBytes{0}, g_hybSrvQueued{0}, g_hybSrvQueuedBytes{0};
+static std::atomic<uint64_t> g_hybTwinsLive{0}, g_hybTwinsTotal{0}, g_hybTwinFail{0}, g_hybPlaced{0};
+// Bytes the submitted lists / new SRVs referenced (exact union per submission), and the part of it
+// already referenced by an earlier submission of the same frame.
+static std::atomic<uint64_t> g_hybUnionBytes{0}, g_hybRecopyBytes{0}, g_hybAsync{0};
+
+static inline HybHeap* FindHyb(const HybTable* t, uint64_t va)
+{
+    for (int i = 0; i < t->n; ++i) {
+        HybHeap* h = t->h[i];
+        if (va - h->srcVA < h->size) return h->bad.load(std::memory_order_relaxed) ? nullptr : h;
+    }
+    return nullptr;
+}
+static HybHeap* FindHyb(uint64_t va)
+{
+    const HybTable* t = g_hybTable.load(std::memory_order_acquire);
+    return t && va ? FindHyb(t, va) : nullptr;
+}
+
+static void PublishHybTable(HybHeap* add, HybHeap* remove) // caller holds g_hybTableMutex
+{
+    const HybTable* cur = g_hybTable.load(std::memory_order_relaxed);
+    HybTable* t = new HybTable();
+    t->n = 0;
+    if (cur)
+        for (int i = 0; i < cur->n; ++i)
+            if (cur->h[i] != remove) t->h[t->n++] = cur->h[i];
+    if (add && t->n < kMaxHybHeaps) t->h[t->n++] = add;
+    g_hybTable.store(t, std::memory_order_release);
+}
+
+static D3D12_RESOURCE_DESC BufferDesc(uint64_t width)
+{
+    D3D12_RESOURCE_DESC d = {};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    d.Width = width; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
+    d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    return d;
+}
+
+// CreatePlacedResource past our hook (no record, no stats).
+static HRESULT PlaceRaw(ID3D12Device* d, ID3D12Heap* heap, uint64_t off, const D3D12_RESOURCE_DESC* rd,
+                        D3D12_RESOURCE_STATES st, ID3D12Resource** out)
+{
+    *out = nullptr;
+    return o_CPR ? o_CPR(d, heap, off, rd, st, nullptr, IID_PPV_ARGS(out))
+                 : d->CreatePlacedResource(heap, off, rd, st, nullptr, IID_PPV_ARGS(out));
+}
+
+// Called after the game created a heap (not one stage 2c put into CPU-visible VRAM).
+static void HybOnHeapCreated(ID3D12Device* d, const D3D12_HEAP_DESC* hd, void* pv)
+{
+    if (!hd || !pv || hd->Properties.Type != D3D12_HEAP_TYPE_UPLOAD || !HybDevice(d)) return;
+    if (hd->Flags & D3D12_HEAP_FLAG_DENY_BUFFERS) return;
+    const uint64_t size = hd->SizeInBytes & ~0xffffull; // whole 64 KB pages (our buffers need them)
+    if (!size) return;
+    std::lock_guard<std::mutex> lk(g_hybTableMutex);
+    const HybTable* cur = g_hybTable.load(std::memory_order_relaxed);
+    if (cur && cur->n >= kMaxHybHeaps) {
+        static bool warned = false;
+        if (!warned) { warned = true; Log("hybrid: %d mirrored heaps, no more mirrors", kMaxHybHeaps); }
+        return;
+    }
+    HybHeap* h = new HybHeap;
+    h->size = size;
+    HRESULT hr = static_cast<IUnknown*>(pv)->QueryInterface(IID_PPV_ARGS(&h->game));
+    D3D12_HEAP_DESC md = {};
+    md.SizeInBytes = size;
+    md.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    md.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    if (SUCCEEDED(hr)) hr = o_CH ? o_CH(d, &md, IID_PPV_ARGS(&h->mirror)) : E_FAIL;
+    const D3D12_RESOURCE_DESC wd = BufferDesc(size);
+    if (SUCCEEDED(hr)) hr = PlaceRaw(d, h->game, 0, &wd, D3D12_RESOURCE_STATE_GENERIC_READ, &h->src);
+    if (SUCCEEDED(hr)) hr = PlaceRaw(d, h->mirror, 0, &wd, D3D12_RESOURCE_STATE_COMMON, &h->dst);
+    if (SUCCEEDED(hr) && g_cfg.hybridCheck) {
+        void* p = nullptr;
+        if (SUCCEEDED(h->src->Map(0, nullptr, &p))) h->cpu = (const uint8_t*)p;
+    }
+    if (FAILED(hr)) {
+        g_hybFailed.fetch_add(1, std::memory_order_relaxed);
+        Log("hybrid: mirroring UPLOAD heap %.2f MB failed (0x%08lx); it stays in system memory, as without the fix",
+            MB(hd->SizeInBytes), hr);
+        if (h->dst) h->dst->Release();
+        if (h->src) h->src->Release();
+        if (h->mirror) h->mirror->Release();
+        if (h->game) h->game->Release();
+        delete h;
+        return;
+    }
+    h->srcVA = h->src->GetGPUVirtualAddress();
+    h->dstVA = h->dst->GetGPUVirtualAddress();
+    h->id = g_hybHeaps.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_hybLiveBytes.fetch_add(size, std::memory_order_relaxed);
+    h->src->SetName(L"egpu_fix mirror source (whole UPLOAD heap)");
+    h->dst->SetName(L"egpu_fix mirror (whole heap)");
+    h->mirror->SetName(L"egpu_fix UPLOAD heap mirror");
+    PublishHybTable(h, nullptr);
+    Log("hybrid: UPLOAD heap #%llu %.2f MB (flags 0x%x, align %llu) mirrored: game VA 0x%llx -> DEFAULT VA 0x%llx"
+        " (live mirrors %.0f MB)", h->id, MB(size), (unsigned)hd->Flags, hd->Alignment, h->srcVA, h->dstVA,
+        MB(g_hybLiveBytes.load()));
+}
+
+// The game placed a resource: if in a mirrored heap, check that its VA is heap VA + offset.
+static void HybOnPlaced(ID3D12Heap* heap, uint64_t off, const D3D12_RESOURCE_DESC* desc, void* pv)
+{
+    const HybTable* t = g_hybTable.load(std::memory_order_acquire);
+    if (!t || !heap || !pv) return;
+    for (int i = 0; i < t->n; ++i) {
+        HybHeap* h = t->h[i];
+        if (h->game != heap) continue;
+        if (!desc || desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
+        ID3D12Resource* r = nullptr;
+        if (FAILED(static_cast<IUnknown*>(pv)->QueryInterface(IID_PPV_ARGS(&r))) || !r) return;
+        const uint64_t va = r->GetGPUVirtualAddress();
+        r->Release();
+        g_hybPlaced.fetch_add(1, std::memory_order_relaxed);
+        if (va != h->srcVA + off && !h->bad.exchange(true)) {
+            g_hybBadLayout.fetch_add(1, std::memory_order_relaxed);
+            Log("hybrid: heap #%llu: buffer placed at offset 0x%llx has VA 0x%llx, expected 0x%llx;"
+                " no more redirects into this heap", h->id, off, va, h->srcVA + off);
+        }
+        return;
+    }
+}
+
+// The game released a mirrored heap (only our reference is left): stop
+// redirecting into it, release our objects once the GPU is done. Checked every
+// 64 submissions (caller holds g_fixMutex).
+static void HybPollRetire()
+{
+    static uint32_t tick = 0;
+    if (++tick % 64) return;
+    const HybTable* t = g_hybTable.load(std::memory_order_acquire);
+    if (!t) return;
+    for (int i = 0; i < t->n; ++i) {
+        HybHeap* h = t->h[i];
+        h->game->AddRef();
+        if (h->game->Release() != 1) continue;
+        {
+            std::lock_guard<std::mutex> lk(g_hybTableMutex);
+            PublishHybTable(nullptr, h);
+        }
+        h->dead = true;
+        if (h->cpu) { h->src->Unmap(0, nullptr); h->cpu = nullptr; }
+        DeferRelease(h->src, h->id, "mirror source buffer of released UPLOAD heap");
+        DeferRelease(h->dst, h->id, "mirror buffer of released UPLOAD heap");
+        DeferRelease(h->mirror, h->id, "DEFAULT mirror of released UPLOAD heap");
+        h->game->Release(); // the heap itself dies with src (placed resources keep their heap alive internally)
+        g_hybRetired.fetch_add(1, std::memory_order_relaxed);
+        g_hybLiveBytes.fetch_sub(h->size, std::memory_order_relaxed);
+        Log("hybrid: the game released UPLOAD heap #%llu; its mirror goes once the GPU is done", h->id);
+    }
+}
+
+// ---- VB / IB views --------------------------------------------------------------
+// Returns the views to pass on: v itself, or tmp with views into mirrored heaps redirected.
+static const D3D12_VERTEX_BUFFER_VIEW* HybVB(ID3D12GraphicsCommandList* cl, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v,
+                                             D3D12_VERTEX_BUFFER_VIEW* tmp)
+{
+    const HybTable* t = g_hybTable.load(std::memory_order_acquire);
+    if (!t || t_inFix) return v;
+    ListState* ls = nullptr;
+    for (UINT k = 0; k < n; ++k) {
+        const uint64_t va = v[k].BufferLocation;
+        HybHeap* h = va ? FindHyb(t, va) : nullptr;
+        if (!h) continue;
+        if (!ls) {
+            ls = FindListState(cl);
+            if (!ls || !ls->open || !ls->direct || !g_hybRedirect.load(std::memory_order_relaxed)) {
+                Bump(TS()->misc[M_HYB_SKIP]);
+                return v;
+            }
+            memcpy(tmp, v, n * sizeof(*v));
+        }
+        const uint64_t lo = va - h->srcVA;
+        uint64_t hi = lo + v[k].SizeInBytes;
+        if (hi > h->size) hi = h->size;
+        if (hi > lo) ls->AddH(h, lo, hi);
+        tmp[k].BufferLocation = h->dstVA + lo;
+        Bump(TS()->misc[M_HYB_VB]);
+    }
+    return ls ? tmp : v;
+}
+
+// Returns the IB view to pass on (v or *tmp).
+static const D3D12_INDEX_BUFFER_VIEW* HybIB(ID3D12GraphicsCommandList* cl, const D3D12_INDEX_BUFFER_VIEW* v,
+                                            D3D12_INDEX_BUFFER_VIEW* tmp)
+{
+    const HybTable* t = g_hybTable.load(std::memory_order_acquire);
+    if (!t || t_inFix || !v->BufferLocation) return v;
+    HybHeap* h = FindHyb(t, v->BufferLocation);
+    if (!h) return v;
+    ListState* ls = FindListState(cl);
+    if (!ls || !ls->open || !ls->direct || !g_hybRedirect.load(std::memory_order_relaxed)) {
+        Bump(TS()->misc[M_HYB_SKIP]);
+        return v;
+    }
+    const uint64_t lo = v->BufferLocation - h->srcVA;
+    uint64_t hi = lo + v->SizeInBytes;
+    if (hi > h->size) hi = h->size;
+    if (hi > lo) ls->AddH(h, lo, hi);
+    *tmp = *v;
+    tmp->BufferLocation = h->dstVA + lo;
+    Bump(TS()->misc[M_HYB_IB]);
+    return tmp;
+}
+
+// ---- SRV descriptors ([Fix] HybridSrv) ----------------------------------------------
+// {6a0d3c55-91e2-4f7b-a3c8-5b14e9d2f086}
+static const GUID kHybTwinGuid = { 0x6a0d3c55, 0x91e2, 0x4f7b, { 0xa3, 0xc8, 0x5b, 0x14, 0xe9, 0xd2, 0xf0, 0x86 } };
+
+// Twins of dead game buffers, pushed lock-free from inside D3D12's destruction of
+// the buffer (no locks there); the next submission defers their release.
+struct RetiredTwin { ID3D12Resource* twin; RetiredTwin* next; };
+static std::atomic<RetiredTwin*> g_hybDeadTwins{nullptr};
+
+static void HybTakeDeadTwins() // caller holds g_fixMutex
+{
+    RetiredTwin* p = g_hybDeadTwins.exchange(nullptr, std::memory_order_acquire);
+    while (p) {
+        RetiredTwin* next = p->next;
+        DeferRelease(p->twin, 0, nullptr);
+        delete p;
+        p = next;
+    }
+}
+
+// Holds the twin of a game buffer (private data of the buffer): released, after
+// the GPU is done, when the buffer dies.
+struct HybTwin final : public IUnknown {
+    std::atomic<ULONG> ref{1};
+    ID3D12Resource* twin;
+    uint64_t width;
+    HybTwin(ID3D12Resource* t, uint64_t w) : twin(t), width(w) { if (t) g_hybTwinsLive.fetch_add(1, std::memory_order_relaxed); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown)) { *ppv = this; AddRef(); return S_OK; }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++ref; }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        ULONG r = --ref;
+        if (r == 0) {
+            if (twin) { // nullptr: marks a buffer whose twin could not be created
+                RetiredTwin* e = new RetiredTwin{ twin, g_hybDeadTwins.load(std::memory_order_relaxed) };
+                while (!g_hybDeadTwins.compare_exchange_weak(e->next, e, std::memory_order_release, std::memory_order_relaxed)) {}
+                g_hybTwinsLive.fetch_sub(1, std::memory_order_relaxed);
+            }
+            delete this;
+        }
+        return r;
+    }
+};
+static std::mutex g_hybTwinMutex; // get-or-create of twins
+
+// Twin of a game buffer at the same offset in the mirror (AddRef'd), nullptr on failure.
+static ID3D12Resource* HybGetTwin(ID3D12Device* d, ID3D12Resource* res, HybHeap* h, uint64_t off, uint64_t* width)
+{
+    std::lock_guard<std::mutex> lk(g_hybTwinMutex);
+    IUnknown* u = nullptr;
+    UINT sz = sizeof(u);
+    if (SUCCEEDED(res->GetPrivateData(kHybTwinGuid, &sz, &u)) && u) {
+        HybTwin* ht = static_cast<HybTwin*>(u);
+        ID3D12Resource* t = ht->twin;
+        if (t) t->AddRef();
+        *width = ht->width;
+        u->Release();
+        return t;
+    }
+    D3D12_RESOURCE_DESC rd = res->GetDesc();
+    // GetDesc reports the real alignment (128 for a small tight-aligned buffer), which
+    // CreatePlacedResource rejects (E_INVALIDARG); 0 = default for the flags works.
+    rd.Alignment = 0;
+    ID3D12Resource* t = nullptr;
+    const HRESULT hr = PlaceRaw(d, h->mirror, off, &rd, D3D12_RESOURCE_STATE_COMMON, &t);
+    if (FAILED(hr) || !t) {
+        if (g_hybTwinFail.fetch_add(1, std::memory_order_relaxed) < 10)
+            Log("hybrid: twin for a %llu-byte buffer (flags 0x%x) at heap #%llu +0x%llx failed: 0x%08lx; its SRVs stay on sysmem",
+                rd.Width, (unsigned)rd.Flags, h->id, off, hr);
+        HybTwin* none = new HybTwin(nullptr, rd.Width); // don't try again for this buffer
+        res->SetPrivateDataInterface(kHybTwinGuid, none);
+        none->Release();
+        return nullptr;
+    }
+    HybTwin* ht = new HybTwin(t, rd.Width);
+    const HRESULT ph = res->SetPrivateDataInterface(kHybTwinGuid, ht);
+    ht->Release(); // owned by the buffer now (or released right here, which defers t's release)
+    if (FAILED(ph)) return nullptr;
+    g_hybTwinsTotal.fetch_add(1, std::memory_order_relaxed);
+    t->AddRef();
+    *width = rd.Width;
+    return t;
+}
+
+// Exact element size of a typed buffer view format, 0 = unknown.
+static uint32_t ExactFormatBytes(DXGI_FORMAT f)
+{
+    const int v = (int)f;
+    if (v >= 1 && v <= 4) return 16;   // R32G32B32A32
+    if (v >= 5 && v <= 8) return 12;   // R32G32B32
+    if (v >= 9 && v <= 22) return 8;   // R16G16B16A16, R32G32, R32G8X24
+    if (v >= 23 && v <= 47) return 4;  // R10G10B10A2 .. R24G8
+    if (v >= 48 && v <= 59) return 2;  // R8G8, R16
+    if (v >= 60 && v <= 65) return 1;  // R8, A8
+    if (v >= 87 && v <= 93) return 4;  // B8G8R8A8 / B8G8R8X8 family
+    return 0;
+}
+
+// New SRV ranges, copied at the next HybridSrvCopies game submissions.
+struct HybSrvPend { HybHeap* h; uint64_t lo, hi; int left; };
+static std::mutex g_hybSrvMutex;
+static std::vector<HybSrvPend> g_hybSrvPend;
+
+// CreateShaderResourceView on a buffer in a mirrored heap: creates the redirected
+// view and returns true; false = caller creates the original view.
+static bool HybSrv(ID3D12Device* d, ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                   D3D12_CPU_DESCRIPTOR_HANDLE hnd)
+{
+    const HybTable* t = g_hybTable.load(std::memory_order_acquire);
+    if (!t || !t->n) return false;
+    const uint64_t va = res->GetGPUVirtualAddress(); // 0 for textures
+    HybHeap* h = va ? FindHyb(t, va) : nullptr;
+    if (!h) return false;
+    if (!desc || desc->ViewDimension != D3D12_SRV_DIMENSION_BUFFER || !g_hybRedirect.load(std::memory_order_relaxed)) {
+        Bump(TS()->misc[M_HYB_SRV_SKIP]);
+        return false;
+    }
+    const D3D12_BUFFER_SRV& b = desc->Buffer;
+    const uint64_t elem = b.StructureByteStride ? b.StructureByteStride
+                        : (b.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4 : ExactFormatBytes(desc->Format);
+    const uint64_t off = va - h->srcVA;
+    D3D12_SHADER_RESOURCE_VIEW_DESC nd = *desc;
+    ID3D12Resource* twin = nullptr;
+    ID3D12Resource* target = h->dst;
+    uint64_t lo = 0, hi = 0;
+    if (elem && off % elem == 0) {
+        nd.Buffer.FirstElement += off / elem;
+        Bump(TS()->misc[M_HYB_SRV_ALIAS]);
+    } else {
+        uint64_t width = 0;
+        twin = HybGetTwin(d, res, h, off, &width);
+        if (!twin) { Bump(TS()->misc[M_HYB_SRV_SKIP]); return false; }
+        target = twin;
+        lo = off; hi = off + width; // element size unknown: the whole buffer
+        Bump(TS()->misc[M_HYB_SRV_TWIN]);
+    }
+    if (elem) {
+        lo = off + b.FirstElement * elem;
+        hi = lo + (uint64_t)b.NumElements * elem;
+    }
+    if (hi > h->size) hi = h->size;
+    if (hi > lo) {
+        std::lock_guard<std::mutex> lk(g_hybSrvMutex);
+        g_hybSrvPend.push_back({ h, lo, hi, g_cfg.hybridSrvCopies });
+        g_hybSrvQueued.fetch_add(1, std::memory_order_relaxed);
+        g_hybSrvQueuedBytes.fetch_add(hi - lo, std::memory_order_relaxed);
+    }
+    if (g_cfg.hybridCheck)
+        if (ResRec* r = Lookup(va)) r->hcSrv.store(true, std::memory_order_relaxed);
+    o_CSRV(d, target, &nd, hnd);
+    if (twin) twin->Release();
+    return true;
+}
+
+// Moves the pending SRV ranges into rs (caller holds g_fixMutex).
+static void HybTakeSrvRanges(std::vector<HybRange>& rs)
+{
+    std::lock_guard<std::mutex> lk(g_hybSrvMutex);
+    size_t o = 0;
+    for (size_t i = 0; i < g_hybSrvPend.size(); ++i) {
+        HybSrvPend& p = g_hybSrvPend[i];
+        rs.push_back({ p.h, p.lo, p.hi });
+        if (--p.left > 0) g_hybSrvPend[o++] = p;
+    }
+    g_hybSrvPend.resize(o);
+}
+
+// ---- HybridCheck ([Fix] HybridCheck=1, Measure=1 only) ---------------------------------
+// Finds mirrored buffers whose system-memory data changed after their last copy
+// although no submitted list referenced them again: exactly what a shader would
+// read stale through a redirected SRV. At each copy a buffer gets a sampled hash;
+// at every later game submission (and at its death) it is hashed again. Changes
+// are counted (by age, SRV or not, size), logged (first ones) and repaired: the
+// buffer is copied in this submission. CPU reads of write-combined memory are
+// slow, so this costs frame time; it is a diagnostic.
+static constexpr uint64_t kHcMaxAgeEcl = 1200; // stop watching a buffer this many submissions after its last copy
+enum { HA_NEW, HA_PREV, HA_OLD, HA_COUNT };    // age at the change: created this frame / last frame / older
+struct HcStats {
+    uint64_t stale[HA_COUNT][2][4];            // [age][has SRV][size bucket]
+    uint64_t hashed, copied, submits, deathChecked, deathChanged;
+    uint64_t copiedBytes, redundant, redundantBytes; // buffers copied / copied again with unchanged data
+    double ms;
+};
+static HcStats g_hc = {};                      // guarded by g_fixMutex; taken by the stats thread
+static std::vector<ResRec*> g_hcList;          // watched buffers (g_fixMutex)
+static std::vector<ResRec*> g_hcScratch;
+static uint64_t g_hcEcl = 0;
+static int g_hcLogged = 0;
+
+static int SizeBucket(uint64_t s) { return s < 4096 ? 0 : s < 65536 ? 1 : s < (1u << 20) ? 2 : 3; }
+
+// Sampled hash of write-combined memory: whole range up to 4 KB, else the first
+// and last 64 bytes plus 16 bytes of every KB. Streaming loads (MOVNTDQA) are
+// the fast way to read WC memory.
+static uint64_t HashMem(const uint8_t* p, uint64_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull ^ n;
+    const uint64_t n16 = n & ~15ull;
+    auto mix = [&](uint64_t o) {
+        const __m128i v = _mm_stream_load_si128((__m128i*)(p + o));
+        h = (h ^ (uint64_t)_mm_cvtsi128_si64(v)) * 0x100000001b3ull;
+        h = (h ^ (uint64_t)_mm_extract_epi64(v, 1)) * 0x100000001b3ull;
+        h ^= h >> 29;
+    };
+    if (n16 <= 4096) {
+        for (uint64_t o = 0; o < n16; o += 16) mix(o);
+    } else {
+        for (uint64_t o = 0; o < 64; o += 16) mix(o);
+        for (uint64_t o = 1024; o < n16 - 64; o += 1024) mix(o);
+        for (uint64_t o = n16 - 64; o < n16; o += 16) mix(o);
+    }
+    return h;
+}
+
+static inline uint64_t HcHash(const ResRec* r)
+{
+    const HybHeap* h = r->hh;
+    return HashMem(h->cpu + (r->va - h->srcVA), r->size);
+}
+
+// At a game submission, before the copies are recorded (caller holds g_fixMutex;
+// rs merged). May append repair ranges.
+static void HcOnSubmit(std::vector<HybRange>& rs)
+{
+    const int64_t t0 = Qpc();
+    const uint64_t ecl = ++g_hcEcl, frame = g_frames.load(std::memory_order_relaxed);
+    ++g_hc.submits;
+    // 1) Buffers this submission copies: take a new snapshot.
+    g_hcScratch.clear();
+    AcquireSRWLockShared(&g_resLock);
+    for (const HybRange& e : rs) {
+        const HybHeap* h = e.k;
+        if (h->dead || !h->cpu) continue;
+        const uint64_t vlo = h->srcVA + e.lo, vhi = h->srcVA + e.hi;
+        auto it = g_byVa.upper_bound(vlo);
+        if (it != g_byVa.begin()) --it;
+        for (; it != g_byVa.end() && it->first < vhi; ++it) {
+            ResRec* r = it->second;
+            if (r->hh == h && r->va + r->size > vlo) g_hcScratch.push_back(r);
+        }
+    }
+    ReleaseSRWLockShared(&g_resLock);
+    for (ResRec* r : g_hcScratch) {
+        if (r->hcCopyEcl == ecl) continue; // in several ranges
+        const uint64_t hs = HcHash(r);
+        ++g_hc.hashed; ++g_hc.copied;
+        g_hc.copiedBytes += r->size;
+        // Copied before and unchanged since: this copy was not needed (dedup potential).
+        if (r->hcTracked && hs == r->hcHash) { ++g_hc.redundant; g_hc.redundantBytes += r->size; }
+        r->hcHash = hs;
+        r->hcCopyEcl = ecl;
+        if (!r->hcTracked) { r->hcTracked = true; g_hcList.push_back(r); }
+    }
+    // 2) Watched buffers not copied now: changed since their last copy?
+    bool repaired = false;
+    size_t o = 0;
+    for (size_t i = 0; i < g_hcList.size(); ++i) {
+        ResRec* r = g_hcList[i];
+        if (!r->alive.load(std::memory_order_relaxed) || r->hh->dead || ecl - r->hcCopyEcl > kHcMaxAgeEcl) {
+            r->hcTracked = false;
+            continue;
+        }
+        g_hcList[o++] = r;
+        if (r->hcCopyEcl == ecl) continue;
+        const uint64_t hs = HcHash(r);
+        ++g_hc.hashed;
+        if (hs == r->hcHash) continue;
+        const uint64_t age = frame - r->createdFrame, since = ecl - r->hcCopyEcl;
+        const bool srv = r->hcSrv.load(std::memory_order_relaxed);
+        ++g_hc.stale[age == 0 ? HA_NEW : age == 1 ? HA_PREV : HA_OLD][srv ? 1 : 0][SizeBucket(r->size)];
+        ++r->hcChanges;
+        if (g_hcLogged < 40) {
+            ++g_hcLogged;
+            Log("hybrid check: buffer #%llu (%.1f KB, heap #%llu +0x%llx, %s) changed %llu submission(s) after its last copy"
+                " without a new reference: age %llu frames, change #%u -> repaired",
+                r->id, r->size / 1024.0, r->hh->id, r->va - r->hh->srcVA, srv ? "has a redirected SRV" : "no SRV",
+                since, age, r->hcChanges);
+        }
+        r->hcHash = hs;
+        r->hcCopyEcl = ecl;
+        rs.push_back({ r->hh, r->va - r->hh->srcVA, r->va - r->hh->srcVA + r->size });
+        repaired = true;
+    }
+    g_hcList.resize(o);
+    if (repaired) MergeRanges(rs, (uint64_t)g_cfg.hybridMergeKB << 10);
+    g_hc.ms += QpcMs(Qpc() - t0);
+}
+
+// A watched buffer dies: did it change after its last copy? (Called inside
+// D3D12's destruction of the buffer: never wait for g_fixMutex there.)
+static void HcOnDestroyed(ResRec* r)
+{
+    std::unique_lock<std::mutex> lk(g_fixMutex, std::try_to_lock);
+    if (!lk.owns_lock() || !r->hcTracked || r->hh->dead || !r->hh->cpu) return;
+    ++g_hc.deathChecked;
+    if (HcHash(r) != r->hcHash) ++g_hc.deathChanged;
+    r->hcTracked = false; // leaves g_hcList at the next submission (no longer alive)
+}
 
 static inline void TimeCreate(const D3D12_HEAP_PROPERTIES* hp, const D3D12_RESOURCE_DESC* d, int64_t t0)
 {
@@ -1454,7 +2138,10 @@ static HRESULT STDMETHODCALLTYPE Hook_CPR(ID3D12Device* d, ID3D12Heap* heap, UIN
 {
     CreateGuard g;
     HRESULT hr = o_CPR(d, heap, off, desc, st, cv, riid, ppv);
-    if (g.outer && SUCCEEDED(hr) && ppv) OnResourceCreated(nullptr, "placed", nullptr, heap, off, desc, D3D12_HEAP_FLAG_NONE, (uint32_t)st, *ppv);
+    if (g.outer && SUCCEEDED(hr) && ppv) {
+        HybOnPlaced(heap, off, desc, *ppv);
+        OnResourceCreated(nullptr, "placed", nullptr, heap, off, desc, D3D12_HEAP_FLAG_NONE, (uint32_t)st, *ppv);
+    }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE Hook_CPR1(ID3D12Device8* d, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC1* desc,
@@ -1462,8 +2149,11 @@ static HRESULT STDMETHODCALLTYPE Hook_CPR1(ID3D12Device8* d, ID3D12Heap* heap, U
 {
     CreateGuard g;
     HRESULT hr = o_CPR1(d, heap, off, desc, st, cv, riid, ppv);
-    if (g.outer && SUCCEEDED(hr) && ppv)
-        OnResourceCreated(nullptr, "placed1", nullptr, heap, off, reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc), D3D12_HEAP_FLAG_NONE, (uint32_t)st, *ppv);
+    if (g.outer && SUCCEEDED(hr) && ppv) {
+        const D3D12_RESOURCE_DESC* d0 = reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc);
+        HybOnPlaced(heap, off, d0, *ppv);
+        OnResourceCreated(nullptr, "placed1", nullptr, heap, off, d0, D3D12_HEAP_FLAG_NONE, (uint32_t)st, *ppv);
+    }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE Hook_CPR2(ID3D12Device10* d, ID3D12Heap* heap, UINT64 off, const D3D12_RESOURCE_DESC1* desc,
@@ -1472,8 +2162,11 @@ static HRESULT STDMETHODCALLTYPE Hook_CPR2(ID3D12Device10* d, ID3D12Heap* heap, 
 {
     CreateGuard g;
     HRESULT hr = o_CPR2(d, heap, off, desc, layout, cv, ncf, cf, riid, ppv);
-    if (g.outer && SUCCEEDED(hr) && ppv)
-        OnResourceCreated(nullptr, "placed2(layout)", nullptr, heap, off, reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc), D3D12_HEAP_FLAG_NONE, (uint32_t)layout, *ppv);
+    if (g.outer && SUCCEEDED(hr) && ppv) {
+        const D3D12_RESOURCE_DESC* d0 = reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc);
+        HybOnPlaced(heap, off, d0, *ppv);
+        OnResourceCreated(nullptr, "placed2(layout)", nullptr, heap, off, d0, D3D12_HEAP_FLAG_NONE, (uint32_t)layout, *ppv);
+    }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE Hook_CH(ID3D12Device* d, const D3D12_HEAP_DESC* hd, REFIID riid, void** ppv)
@@ -1483,7 +2176,10 @@ static HRESULT STDMETHODCALLTYPE Hook_CH(ID3D12Device* d, const D3D12_HEAP_DESC*
     HRESULT hr = S_OK;
     if (!(g.outer && TryVidHeap(d, hd, riid, ppv, &vid)))
         hr = o_CH(d, hd, riid, ppv);
-    if (g.outer && SUCCEEDED(hr) && ppv) OnHeapCreated(vid ? "CreateHeap -> CPU-visible VRAM" : "CreateHeap", hd, *ppv, vid);
+    if (g.outer && SUCCEEDED(hr) && ppv && *ppv) {
+        if (!vid) HybOnHeapCreated(d, hd, *ppv);
+        OnHeapCreated(vid ? "CreateHeap -> CPU-visible VRAM" : "CreateHeap", hd, *ppv, vid);
+    }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE Hook_CH1(ID3D12Device4* d, const D3D12_HEAP_DESC* hd, ID3D12ProtectedResourceSession* ps,
@@ -1494,7 +2190,10 @@ static HRESULT STDMETHODCALLTYPE Hook_CH1(ID3D12Device4* d, const D3D12_HEAP_DES
     HRESULT hr = S_OK;
     if (!(g.outer && !ps && TryVidHeap(d, hd, riid, ppv, &vid)))
         hr = o_CH1(d, hd, ps, riid, ppv);
-    if (g.outer && SUCCEEDED(hr) && ppv) OnHeapCreated(vid ? "CreateHeap1 -> CPU-visible VRAM" : "CreateHeap1", hd, *ppv, vid);
+    if (g.outer && SUCCEEDED(hr) && ppv && *ppv) {
+        if (!vid && !ps) HybOnHeapCreated(d, hd, *ppv);
+        OnHeapCreated(vid ? "CreateHeap1 -> CPU-visible VRAM" : "CreateHeap1", hd, *ppv, vid);
+    }
     return hr;
 }
 static void STDMETHODCALLTYPE Hook_CCBV(ID3D12Device* d, const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
@@ -1506,14 +2205,17 @@ static void STDMETHODCALLTYPE Hook_CCBV(ID3D12Device* d, const D3D12_CONSTANT_BU
 static void STDMETHODCALLTYPE Hook_CSRV(ID3D12Device* d, ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                         D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
-    if (res && !desc) {
-        CountRes(U_SRV_DESC, res, 0, kToEnd);
-    } else if (res && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
-        const D3D12_BUFFER_SRV& b = desc->Buffer;
-        const uint64_t elem = b.StructureByteStride ? b.StructureByteStride
-                            : (b.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4 : FormatBytes(desc->Format);
-        CountRes(U_SRV_DESC, res, b.FirstElement * elem, (uint64_t)b.NumElements * elem);
+    if (g_cfg.measure) {
+        if (res && !desc) {
+            CountRes(U_SRV_DESC, res, 0, kToEnd);
+        } else if (res && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+            const D3D12_BUFFER_SRV& b = desc->Buffer;
+            const uint64_t elem = b.StructureByteStride ? b.StructureByteStride
+                                : (b.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4 : FormatBytes(desc->Format);
+            CountRes(U_SRV_DESC, res, b.FirstElement * elem, (uint64_t)b.NumElements * elem);
+        }
     }
+    if (res && g_cfg.hybridSrv && HybSrv(d, res, desc, h)) return; // stage 2d: view created on the mirror
     o_CSRV(d, res, desc, h);
 }
 
@@ -1674,78 +2376,132 @@ static FixQueue* CreateFixQueue(ID3D12CommandQueue* q) // caller holds g_fixMute
     fq->list->SetName(L"egpu_fix copy list");
     fq->allocs.push_back({ a, 0 });
     if (g_cfg.gpuTiming) SetupTiming(fq, dev);
+    if (g_cfg.hybridCopyQueue) {
+        // Stage 2d copies on our own COPY queue; on failure they stay on the game's queue.
+        D3D12_COMMAND_QUEUE_DESC cd = {};
+        cd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        ID3D12CommandAllocator* ca = nullptr;
+        HRESULT ch = dev->CreateCommandQueue(&cd, IID_PPV_ARGS(&fq->cq));
+        if (SUCCEEDED(ch)) ch = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fq->cfence));
+        if (SUCCEEDED(ch)) ch = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&ca));
+        if (SUCCEEDED(ch)) ch = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, ca, nullptr, IID_PPV_ARGS(&fq->clist));
+        if (SUCCEEDED(ch)) {
+            ++t_inFix;
+            ch = fq->clist->Close();
+            --t_inFix;
+        }
+        if (SUCCEEDED(ch)) {
+            fq->cq->SetName(L"egpu_fix mirror copy queue");
+            fq->clist->SetName(L"egpu_fix mirror copy list (COPY queue)");
+            fq->callocs.push_back({ ca, 0 });
+            Log("hybrid: mirror copies run on our COPY queue %p; game submissions wait for its fence", fq->cq);
+        } else {
+            Log("hybrid: creating the COPY queue failed (0x%08lx); mirror copies stay on the game's queue", ch);
+            if (fq->clist) fq->clist->Release();
+            if (ca) ca->Release();
+            if (fq->cfence) fq->cfence->Release();
+            if (fq->cq) fq->cq->Release();
+            fq->clist = nullptr; fq->cfence = nullptr; fq->cq = nullptr;
+        }
+    }
     dev->Release();
     g_fixQueues.push_back(fq);
     Log("fix: injection context ready for DIRECT queue %p (list %p)", q, fq->list);
     return fq;
 }
 
-// Index of an allocator the GPU is done with (creates or waits if needed); -1 on failure.
-static int AcquireFixAllocator(FixQueue* fq)
+// Index of an allocator in pool the GPU is done with (creates or waits if needed); -1 on failure.
+static int AcquireAlloc(FixQueue* fq, std::vector<FixAlloc>& pool, ID3D12Fence* fence, D3D12_COMMAND_LIST_TYPE type)
 {
-    const uint64_t done = fq->fence->GetCompletedValue();
+    const uint64_t done = fence->GetCompletedValue();
     size_t oldest = 0;
-    for (size_t i = 0; i < fq->allocs.size(); ++i) {
-        if (fq->allocs[i].fence <= done) return (int)i;
-        if (fq->allocs[i].fence < fq->allocs[oldest].fence) oldest = i;
+    for (size_t i = 0; i < pool.size(); ++i) {
+        if (pool[i].fence <= done) return (int)i;
+        if (pool[i].fence < pool[oldest].fence) oldest = i;
     }
-    if (fq->allocs.size() < kMaxFixAllocators) {
+    if (pool.size() < kMaxFixAllocators) {
         ID3D12Device* dev = nullptr;
         ID3D12CommandAllocator* a = nullptr;
         if (SUCCEEDED(fq->q->GetDevice(IID_PPV_ARGS(&dev))) && dev) {
-            dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
+            dev->CreateCommandAllocator(type, IID_PPV_ARGS(&a));
             dev->Release();
         }
         if (a) {
-            fq->allocs.push_back({ a, 0 });
-            if (fq->allocs.size() == kMaxFixAllocators) Log("fix: allocator pool reached %zu", kMaxFixAllocators);
-            return (int)fq->allocs.size() - 1;
+            pool.push_back({ a, 0 });
+            if (pool.size() == kMaxFixAllocators) Log("fix: %s allocator pool reached %zu", ListTypeName(type), kMaxFixAllocators);
+            return (int)pool.size() - 1;
         }
     }
-    const uint64_t want = fq->allocs[oldest].fence;
-    if (SUCCEEDED(fq->fence->SetEventOnCompletion(want, fq->ev)) && fq->fence->GetCompletedValue() < want)
+    const uint64_t want = pool[oldest].fence;
+    if (SUCCEEDED(fence->SetEventOnCompletion(want, fq->ev)) && fence->GetCompletedValue() < want)
         WaitForSingleObject(fq->ev, 5000);
-    return fq->fence->GetCompletedValue() >= want ? (int)oldest : -1;
+    return fence->GetCompletedValue() >= want ? (int)oldest : -1;
+}
+static int AcquireFixAllocator(FixQueue* fq) { return AcquireAlloc(fq, fq->allocs, fq->fence, D3D12_COMMAND_LIST_TYPE_DIRECT); }
+
+static D3D12_RESOURCE_BARRIER CopyDoneBarrier(ID3D12Resource* r, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = after;
+    return b;
 }
 
-// Records the page -> twin copies for fq->scratch into fq->list (caller set t_inFix).
-static HRESULT RecordCopies(FixQueue* fq, ID3D12CommandAllocator* alloc, uint64_t& regions, uint64_t& bytes)
+// Stage 2d heap -> mirror copies for hranges (merged). barriers == nullptr: a
+// COPY queue list, where the mirrors just decay to COMMON after the submission.
+static void RecordHybCopies(ID3D12GraphicsCommandList* cl, const std::vector<HybRange>& hranges,
+                            std::vector<D3D12_RESOURCE_BARRIER>* barriers, uint64_t& hregions, uint64_t& hbytes)
+{
+    bool copied = false;
+    for (size_t i = 0; i < hranges.size(); ++i) {
+        HybHeap* h = hranges[i].k;
+        if (h->dead) continue; // the game released the heap: nothing can read it any more
+        const uint64_t lo = hranges[i].lo & ~255ull;
+        uint64_t hi = (hranges[i].hi + 255) & ~255ull;
+        if (hi > h->size) hi = h->size;
+        if (hi > lo) {
+            cl->CopyBufferRegion(h->dst, lo, h->src, lo, hi - lo);
+            ++hregions; hbytes += hi - lo;
+            copied = true;
+        }
+        if (copied && (i + 1 == hranges.size() || hranges[i + 1].k != h)) {
+            // GENERIC_READ covers VB/IB, shader resource (SRVs on the whole-heap buffer) and copy source.
+            if (barriers) barriers->push_back(CopyDoneBarrier(h->dst, D3D12_RESOURCE_STATE_GENERIC_READ));
+            copied = false;
+        }
+    }
+}
+
+// Records our copy list (caller set t_inFix): stage 2a page -> twin copies for
+// fq->scratch, stage 2d heap -> mirror copies for fq->hscratch unless they go to
+// our COPY queue (hyb false), then one barrier per target (they start in COMMON
+// and are promoted to COPY_DEST).
+static HRESULT RecordCopies(FixQueue* fq, ID3D12CommandAllocator* alloc, bool hyb, uint64_t& regions, uint64_t& bytes,
+                            uint64_t& hregions, uint64_t& hbytes)
 {
     std::vector<ListRange>& ranges = fq->scratch;
-    std::sort(ranges.begin(), ranges.end(), [](const ListRange& a, const ListRange& b) {
-        return a.rec != b.rec ? a.rec < b.rec : a.lo < b.lo;
-    });
+    MergeRanges(ranges);
     ID3D12GraphicsCommandList* cl = fq->list;
     HRESULT hr = cl->Reset(alloc, nullptr);
     if (FAILED(hr)) return hr;
     fq->barriers.clear();
-    for (size_t i = 0; i < ranges.size();) {
-        ResRec* r = ranges[i].rec;
-        uint64_t lo = ranges[i].lo, hi = ranges[i].hi;
-        size_t j = i + 1;
-        for (; j < ranges.size() && ranges[j].rec == r && ranges[j].lo <= hi + kMergeGap; ++j)
-            if (ranges[j].hi > hi) hi = ranges[j].hi;
-        const bool lastOfRec = j == ranges.size() || ranges[j].rec != r;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        ResRec* r = ranges[i].k;
         // A dead page here would be a game bug (executing a list that references
         // a released buffer); skip it rather than touch a released twin.
-        if (r->twin && !r->twinDead) {
-            lo &= ~255ull;
-            hi = (hi + 255) & ~255ull;
-            if (hi > r->size) hi = r->size;
-            cl->CopyBufferRegion(r->twin, lo, r->res, lo, hi - lo);
-            ++regions; bytes += hi - lo;
-            if (lastOfRec) {
-                D3D12_RESOURCE_BARRIER b = {};
-                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                b.Transition.pResource = r->twin;
-                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                b.Transition.StateAfter = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-                fq->barriers.push_back(b);
-            }
-        }
-        i = j;
+        if (!r->twin || r->twinDead) continue;
+        const uint64_t lo = ranges[i].lo & ~255ull;
+        uint64_t hi = (ranges[i].hi + 255) & ~255ull;
+        if (hi > r->size) hi = r->size;
+        cl->CopyBufferRegion(r->twin, lo, r->res, lo, hi - lo);
+        ++regions; bytes += hi - lo;
+        if (i + 1 == ranges.size() || ranges[i + 1].k != r)
+            fq->barriers.push_back(CopyDoneBarrier(r->twin, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER));
     }
+    if (hyb) RecordHybCopies(cl, fq->hscratch, &fq->barriers, hregions, hbytes);
     if (!fq->barriers.empty()) cl->ResourceBarrier((UINT)fq->barriers.size(), fq->barriers.data());
     return cl->Close();
 }
@@ -1820,29 +2576,54 @@ static bool InjectExecute(QueueStats* qs, ID3D12CommandQueue* q, UINT n, ID3D12C
     if (!n || !l) return false;
     const int64_t submitQpc = Qpc();
     std::lock_guard<std::mutex> lk(g_fixMutex);
-    if (!g_pendingTwins.empty()) ReleasePendingTwins();
+    const bool hyb = g_hybTable.load(std::memory_order_acquire) != nullptr;
+    if (hyb) HybTakeDeadTwins();
+    if (!g_pendingRel.empty()) ReleasePending();
     if (qs->fixFailed) return false;
 
     // Ranges of all submitted lists (the game closed them before this call).
     FixQueue* fq = qs->fix;
     std::vector<ListRange> local;
+    std::vector<HybRange> hlocal;
     std::vector<ListRange>& rs = fq ? fq->scratch : local;
+    std::vector<HybRange>& hrs = fq ? fq->hscratch : hlocal;
     rs.clear();
-    if (g_cfg.constPages) {
+    hrs.clear();
+    if (g_cfg.constPages || hyb) {
         AcquireSRWLockShared(&g_listLock);
         for (UINT i = 0; i < n; ++i) {
             auto it = g_lists.find(l[i]);
-            if (it != g_lists.end()) rs.insert(rs.end(), it->second->ranges.begin(), it->second->ranges.end());
+            if (it == g_lists.end()) continue;
+            const ListState* ls = it->second;
+            if (g_cfg.constPages) rs.insert(rs.end(), ls->ranges.begin(), ls->ranges.end());
+            if (hyb) hrs.insert(hrs.end(), ls->hranges.begin(), ls->hranges.end());
         }
         ReleaseSRWLockShared(&g_listLock);
     }
-    const bool wantCopy = !rs.empty();
+    if (hyb) {
+        HybTakeSrvRanges(hrs);
+        HybPollRetire();
+        // Stats: exact bytes referenced, and how much of it earlier submissions of this frame referenced too.
+        g_hybUnionBytes.fetch_add(MergeRanges(hrs, 0), std::memory_order_relaxed);
+        if (fq) {
+            const uint64_t frame = g_frames.load(std::memory_order_relaxed);
+            if (frame != fq->hframeNo) { fq->hframe.clear(); fq->hframeNo = frame; }
+            g_hybRecopyBytes.fetch_add(OverlapBytes(hrs, fq->hframe), std::memory_order_relaxed);
+            fq->hframe.insert(fq->hframe.end(), hrs.begin(), hrs.end());
+            MergeRanges(fq->hframe, 0);
+        }
+        MergeRanges(hrs, (uint64_t)g_cfg.hybridMergeKB << 10);
+        if (g_cfg.hybridCheck) HcOnSubmit(hrs);
+        if (g_cfg.hybridNoCopy) hrs.clear(); // negative test: the mirrors stay empty / stale
+    }
+    const bool wantCopy = !rs.empty() || !hrs.empty();
     if (!wantCopy && !g_cfg.gpuTiming) return false;
 
     auto fail = [&](const char* what, HRESULT hr) {
-        // Lists recorded so far still point at twins we cannot fill: stop redirecting.
-        Log("fix: %s failed (0x%08lx) on queue %p; disabling constant page redirects", what, hr, q);
+        // Lists recorded so far still point at twins/mirrors we cannot fill: stop redirecting.
+        Log("fix: %s failed (0x%08lx) on queue %p; disabling redirects", what, hr, q);
         g_fixRedirect.store(false);
+        g_hybRedirect.store(false);
         g_fixFailures.fetch_add(1, std::memory_order_relaxed);
         return false;
     };
@@ -1850,24 +2631,66 @@ static bool InjectExecute(QueueStats* qs, ID3D12CommandQueue* q, UINT n, ID3D12C
         fq = qs->fix = CreateFixQueue(q);
         if (!fq) { qs->fixFailed = true; return wantCopy ? fail("copy context creation", E_FAIL) : false; }
         fq->scratch.swap(local);
+        fq->hscratch.swap(hlocal);
     }
+
+    // Stage 2d copies on our COPY queue ([Fix] HybridCopyQueue): they overlap the game's
+    // earlier work still running on its queue; the game's lists wait for them.
+    uint64_t regions = 0, bytes = 0, hregions = 0, hbytes = 0;
+    const bool async = !fq->hscratch.empty() && fq->cq;
+    if (async) {
+        const int ci = AcquireAlloc(fq, fq->callocs, fq->cfence, D3D12_COMMAND_LIST_TYPE_COPY);
+        if (ci < 0) return fail("COPY queue allocator wait", E_FAIL);
+        ID3D12CommandAllocator* ca = fq->callocs[ci].alloc;
+        ++t_inFix;
+        HRESULT ch = ca->Reset();
+        if (SUCCEEDED(ch)) ch = fq->clist->Reset(ca, nullptr);
+        if (SUCCEEDED(ch)) {
+            RecordHybCopies(fq->clist, fq->hscratch, nullptr, hregions, hbytes);
+            ch = fq->clist->Close();
+        }
+        if (SUCCEEDED(ch)) {
+            ID3D12CommandList* cl = fq->clist;
+            fq->cq->ExecuteCommandLists(1, &cl);
+        }
+        --t_inFix;
+        if (FAILED(ch)) return fail("COPY queue list recording", ch);
+        fq->cq->Signal(fq->cfence, ++fq->cSignaled);
+        fq->callocs[ci].fence = fq->cSignaled;
+        q->Wait(fq->cfence, fq->cSignaled);
+        g_hybAsync.fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool directCopy = !fq->scratch.empty() || (!fq->hscratch.empty() && !async);
 
     bool timing = fq->timing;
     if (timing) ProcessTimingSlots(fq);
-    const uint32_t segs = (wantCopy ? 1u : 0u) + n;
+    const uint32_t segs = (directCopy ? 1u : 0u) + n;
     TsSlot* slot = &fq->slots[fq->nextSlot];
     if (timing && (segs + 1 > (uint32_t)kTsPerBank || slot->pending)) { timing = false; ++g_gpuAgg.skipped; }
-    if (!wantCopy && !timing) return false;
+    if (!directCopy && !timing) {
+        if (!async) return false;
+        // Only the wait was needed. Submit the game's lists here so our fence covers them
+        // (and with them the COPY queue work they waited for): deferred releases rely on it.
+        oECL(q, n, l);
+        q->Signal(fq->fence, ++fq->lastSignaled);
+        if (g_hybInj.fetch_add(1, std::memory_order_relaxed) == 0)
+            Log("hybrid: first mirror copy (COPY queue) for queue %p: %u game lists -> %llu copies, %.2f MB", q, n, hregions, MB(hbytes));
+        g_hybRegions.fetch_add(hregions, std::memory_order_relaxed);
+        g_hybBytes.fetch_add(hbytes, std::memory_order_relaxed);
+        return true;
+    }
 
     const int ai = AcquireFixAllocator(fq);
-    if (ai < 0) return wantCopy ? fail("allocator wait", E_FAIL) : false;
+    if (ai < 0) {
+        if (directCopy || async) return fail("allocator wait", E_FAIL); // async: the wait is queued, lists must follow
+        return false;
+    }
     ID3D12CommandAllocator* alloc = fq->allocs[ai].alloc;
 
     ++t_inFix;
     HRESULT hr = alloc->Reset();
-    uint64_t regions = 0, bytes = 0;
-    if (SUCCEEDED(hr) && wantCopy) hr = RecordCopies(fq, alloc, regions, bytes);
-    if (FAILED(hr)) { --t_inFix; return wantCopy ? fail("copy list recording", hr) : false; }
+    if (SUCCEEDED(hr) && directCopy) hr = RecordCopies(fq, alloc, !async, regions, bytes, hregions, hbytes);
+    if (FAILED(hr)) { --t_inFix; return (directCopy || async) ? fail("copy list recording", hr) : false; }
     const uint32_t bank = fq->nextBank;
     if (timing) {
         HRESULT th = fq->post->Reset(alloc, nullptr);
@@ -1884,11 +2707,11 @@ static bool InjectExecute(QueueStats* qs, ID3D12CommandQueue* q, UINT n, ID3D12C
         }
     }
     --t_inFix;
-    if (!wantCopy && !timing) return false;
+    if (!directCopy && !timing && !async) return false;
 
     if (timing) { // what each game list recorded, for the breakdown
         slot->segs.clear();
-        if (wantCopy) slot->segs.push_back({ {}, true, true });
+        if (directCopy) slot->segs.push_back({ {}, true, true });
         AcquireSRWLockShared(&g_listLock);
         for (UINT i = 0; i < n; ++i) {
             TsSeg sg = {};
@@ -1903,11 +2726,11 @@ static bool InjectExecute(QueueStats* qs, ID3D12CommandQueue* q, UINT n, ID3D12C
     if (timing) {
         for (uint32_t k = 0; k < segs; ++k) {
             fq->submit.push_back(fq->tsList[bank][k]);
-            fq->submit.push_back(wantCopy ? (k ? l[k - 1] : (ID3D12CommandList*)fq->list) : l[k]);
+            fq->submit.push_back(directCopy ? (k ? l[k - 1] : (ID3D12CommandList*)fq->list) : l[k]);
         }
         fq->submit.push_back(fq->post);
     } else {
-        fq->submit.push_back(fq->list);
+        if (directCopy) fq->submit.push_back(fq->list);
         fq->submit.insert(fq->submit.end(), l, l + n);
     }
     oECL(q, (UINT)fq->submit.size(), fq->submit.data());
@@ -1925,12 +2748,18 @@ static bool InjectExecute(QueueStats* qs, ID3D12CommandQueue* q, UINT n, ID3D12C
         fq->nextSlot = (fq->nextSlot + 1) % kTsSlots;
         fq->nextBank = (bank + 1) % kTsBanks;
     }
-    if (wantCopy) {
+    if (!fq->scratch.empty()) {
         if (g_fixInjections.fetch_add(1, std::memory_order_relaxed) == 0)
             Log("fix: first copy injection on queue %p: %u game lists, %zu ranges -> %llu copies, %.2f MB",
                 q, n, fq->scratch.size(), regions, MB(bytes));
         g_fixCopyRegions.fetch_add(regions, std::memory_order_relaxed);
         g_fixCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    if (!fq->hscratch.empty()) {
+        if (g_hybInj.fetch_add(1, std::memory_order_relaxed) == 0)
+            Log("hybrid: first mirror copy on queue %p: %u game lists -> %llu copies, %.2f MB", q, n, hregions, MB(hbytes));
+        g_hybRegions.fetch_add(hregions, std::memory_order_relaxed);
+        g_hybBytes.fetch_add(hbytes, std::memory_order_relaxed);
     }
     return true;
 }
@@ -1941,11 +2770,12 @@ template <int V> struct QueueHooks {
     static inline PFN_ECL oECL = nullptr;
     static void STDMETHODCALLTYPE ECL(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* l)
     {
+        if (t_inFix) { oECL(q, n, l); return; } // our own COPY queue submission
         QueueStats* qs = OnExecuteCommandLists(q, n);
         const bool game = t_presentDepth == 0;
         const int64_t t0 = Qpc();
-        if (!(game && (g_cfg.constPages || g_cfg.gpuTiming) && qs->desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
-              InjectExecute(qs, q, n, l, oECL)))
+        const bool fix = g_cfg.constPages || g_cfg.gpuTiming || g_hybTable.load(std::memory_order_relaxed);
+        if (!(game && fix && qs->desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT && InjectExecute(qs, q, n, l, oECL)))
             oECL(q, n, l);
         if (game) AddTime(g_apiTime[AT_ECL], Qpc() - t0);
     }
@@ -2010,22 +2840,29 @@ template <int V> struct ListHooks {
     static void STDMETHODCALLTYPE CmpSrv(CL* s, UINT i, D3D12_GPU_VIRTUAL_ADDRESS va) { CountVA(U_RSRV_C, va); oCmpSrv(s, i, va); }
     static void STDMETHODCALLTYPE VB(CL* s, UINT start, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v)
     {
-        if (v) {
+        D3D12_VERTEX_BUFFER_VIEW tmp[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+        const D3D12_VERTEX_BUFFER_VIEW* use = v;
+        if (v && n && n <= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT && g_hybTable.load(std::memory_order_relaxed))
+            use = HybVB(s, n, v, tmp); // stage 2d
+        if (v && g_cfg.measure) {
             ListCounters* c = Counters(s);
             for (UINT k = 0; k < n; ++k) {
                 const ResRec* r = CountVA(U_VB, v[k].BufferLocation, v[k].SizeInBytes);
                 if (c && v[k].BufferLocation) {
                     ++c->vbAll;
-                    if (r && IsSysmem(r->cat)) ++c->vbSys;
+                    if (r && IsSysmem(r->cat) && use[k].BufferLocation == v[k].BufferLocation) ++c->vbSys;
                 }
             }
         }
-        oVB(s, start, n, v);
+        oVB(s, start, n, use);
     }
     static void STDMETHODCALLTYPE IB(CL* s, const D3D12_INDEX_BUFFER_VIEW* v)
     {
-        if (v) CountVA(U_IB, v->BufferLocation, v->SizeInBytes);
-        oIB(s, v);
+        D3D12_INDEX_BUFFER_VIEW tmp;
+        const D3D12_INDEX_BUFFER_VIEW* use = v;
+        if (v && g_hybTable.load(std::memory_order_relaxed)) use = HybIB(s, v, &tmp); // stage 2d
+        if (v && g_cfg.measure) CountVA(U_IB, v->BufferLocation, v->SizeInBytes);
+        oIB(s, use);
     }
     static void STDMETHODCALLTYPE Draw(CL* s, UINT a, UINT b, UINT c, UINT d)
     {
@@ -2071,9 +2908,9 @@ template <int V> struct ListHooks {
     {
         if (t_inFix) return oClose(s); // our own copy list
         Bump(TS()->misc[t_presentDepth ? M_CL_CLOSE_DXGI : M_CL_CLOSE]);
-        FlushPending();
+        if (g_cfg.measure) FlushPending();
         CheckListVtable(s);
-        if (g_cfg.constPages || g_cfg.gpuTiming) OnListClose(s);
+        if (g_cfg.constPages || g_cfg.gpuTiming || g_cfg.hybridHeaps) OnListClose(s);
         return oClose(s);
     }
     static HRESULT STDMETHODCALLTYPE Reset(CL* s, ID3D12CommandAllocator* a, ID3D12PipelineState* p)
@@ -2082,30 +2919,32 @@ template <int V> struct ListHooks {
         Bump(TS()->misc[t_presentDepth ? M_CL_RESET_DXGI : M_CL_RESET]);
         CheckListVtable(s);
         const HRESULT hr = oReset(s, a, p);
-        if (g_cfg.constPages || g_cfg.gpuTiming) OnListReset(s, SUCCEEDED(hr));
+        if (g_cfg.constPages || g_cfg.gpuTiming || g_cfg.hybridHeaps) OnListReset(s, SUCCEEDED(hr));
         return hr;
     }
 
+    // Fix-only mode ([General] Measure=0) hooks only what stage 2d needs ("lean").
     static void Install(void** vt, const char* typeName)
     {
-        struct Item { int idx; void* detour; void** orig; const char* name; };
+        struct Item { int idx; void* detour; void** orig; const char* name; bool lean; };
         const Item items[] = {
-            { g_vtbl.CL_SetGraphicsRootConstantBufferView,  (void*)&GfxCbv,   (void**)&oGfxCbv,   "SetGraphicsRootConstantBufferView" },
-            { g_vtbl.CL_SetComputeRootConstantBufferView,   (void*)&CmpCbv,   (void**)&oCmpCbv,   "SetComputeRootConstantBufferView" },
-            { g_vtbl.CL_SetGraphicsRootShaderResourceView,  (void*)&GfxSrv,   (void**)&oGfxSrv,   "SetGraphicsRootShaderResourceView" },
-            { g_vtbl.CL_SetComputeRootShaderResourceView,   (void*)&CmpSrv,   (void**)&oCmpSrv,   "SetComputeRootShaderResourceView" },
-            { g_vtbl.CL_IASetVertexBuffers,                 (void*)&VB,       (void**)&oVB,       "IASetVertexBuffers" },
-            { g_vtbl.CL_IASetIndexBuffer,                   (void*)&IB,       (void**)&oIB,       "IASetIndexBuffer" },
-            { g_vtbl.CL_DrawInstanced,                      (void*)&Draw,     (void**)&oDraw,     "DrawInstanced" },
-            { g_vtbl.CL_DrawIndexedInstanced,               (void*)&DrawIdx,  (void**)&oDrawIdx,  "DrawIndexedInstanced" },
-            { g_vtbl.CL_Dispatch,                           (void*)&Dispatch, (void**)&oDispatch, "Dispatch" },
-            { g_vtbl.CL_ExecuteIndirect,                    (void*)&ExecInd,  (void**)&oExecInd,  "ExecuteIndirect" },
-            { g_vtbl.CL_CopyBufferRegion,                   (void*)&CopyBR,   (void**)&oCopyBR,   "CopyBufferRegion" },
-            { g_vtbl.CL_CopyResource,                       (void*)&CopyRes,  (void**)&oCopyRes,  "CopyResource" },
-            { g_vtbl.CL_Close,                              (void*)&Close,    (void**)&oClose,    "Close" },
-            { g_vtbl.CL_Reset,                              (void*)&Reset,    (void**)&oReset,    "Reset" },
+            { g_vtbl.CL_SetGraphicsRootConstantBufferView,  (void*)&GfxCbv,   (void**)&oGfxCbv,   "SetGraphicsRootConstantBufferView", false },
+            { g_vtbl.CL_SetComputeRootConstantBufferView,   (void*)&CmpCbv,   (void**)&oCmpCbv,   "SetComputeRootConstantBufferView", false },
+            { g_vtbl.CL_SetGraphicsRootShaderResourceView,  (void*)&GfxSrv,   (void**)&oGfxSrv,   "SetGraphicsRootShaderResourceView", false },
+            { g_vtbl.CL_SetComputeRootShaderResourceView,   (void*)&CmpSrv,   (void**)&oCmpSrv,   "SetComputeRootShaderResourceView", false },
+            { g_vtbl.CL_IASetVertexBuffers,                 (void*)&VB,       (void**)&oVB,       "IASetVertexBuffers", true },
+            { g_vtbl.CL_IASetIndexBuffer,                   (void*)&IB,       (void**)&oIB,       "IASetIndexBuffer", true },
+            { g_vtbl.CL_DrawInstanced,                      (void*)&Draw,     (void**)&oDraw,     "DrawInstanced", false },
+            { g_vtbl.CL_DrawIndexedInstanced,               (void*)&DrawIdx,  (void**)&oDrawIdx,  "DrawIndexedInstanced", false },
+            { g_vtbl.CL_Dispatch,                           (void*)&Dispatch, (void**)&oDispatch, "Dispatch", false },
+            { g_vtbl.CL_ExecuteIndirect,                    (void*)&ExecInd,  (void**)&oExecInd,  "ExecuteIndirect", false },
+            { g_vtbl.CL_CopyBufferRegion,                   (void*)&CopyBR,   (void**)&oCopyBR,   "CopyBufferRegion", false },
+            { g_vtbl.CL_CopyResource,                       (void*)&CopyRes,  (void**)&oCopyRes,  "CopyResource", false },
+            { g_vtbl.CL_Close,                              (void*)&Close,    (void**)&oClose,    "Close", true },
+            { g_vtbl.CL_Reset,                              (void*)&Reset,    (void**)&oReset,    "Reset", true },
         };
         for (const Item& it : items) {
+            if (!g_cfg.measure && !it.lean) continue;
             char name[128];
             sprintf_s(name, "CL(%s)::%s", typeName, it.name);
             HookVT(vt, it.idx, it.detour, it.orig, name);
@@ -2259,8 +3098,65 @@ struct StatsState {
     uint64_t prevWinBytes[WC_COUNT] = {}, prevWinBufs[WC_COUNT] = {}, prevWinCount = 0;
     size_t prevRecIndex = 0; // g_allRecs entries already classified as "new"
     uint64_t prevFixInj = 0, prevFixRegions = 0, prevFixBytes = 0;
+    uint64_t prevHybInj = 0, prevHybRegions = 0, prevHybBytes = 0, prevHybSrvQ = 0, prevHybSrvQB = 0;
+    uint64_t prevHybUnion = 0, prevHybRecopy = 0, prevHybAsync = 0;
     std::map<DWORD, uint64_t> prevThreadCpu; // thread id -> user+kernel time (100 ns)
 };
+
+// Stage 2d state, both modes.
+static void AppendHybStats(std::string& s, StatsState& st, const uint64_t* dMisc, double div, const char* per)
+{
+    if (!g_cfg.hybridHeaps) return;
+    if (!g_hybOn.load()) { Appendf(s, "  fix Hybrid: OFF (%s)\n", g_hybOffReason); return; }
+    const uint64_t inj = g_hybInj.load(), reg = g_hybRegions.load(), by = g_hybBytes.load();
+    const uint64_t sq = g_hybSrvQueued.load(), sqb = g_hybSrvQueuedBytes.load();
+    const uint64_t un = g_hybUnionBytes.load(), rc = g_hybRecopyBytes.load(), as = g_hybAsync.load();
+    const uint64_t dInj = inj - st.prevHybInj, dReg = reg - st.prevHybRegions, dBy = by - st.prevHybBytes;
+    const uint64_t dSq = sq - st.prevHybSrvQ, dSqb = sqb - st.prevHybSrvQB;
+    const uint64_t dUn = un - st.prevHybUnion, dRc = rc - st.prevHybRecopy, dAs = as - st.prevHybAsync;
+    st.prevHybInj = inj; st.prevHybRegions = reg; st.prevHybBytes = by; st.prevHybSrvQ = sq; st.prevHybSrvQB = sqb;
+    st.prevHybUnion = un; st.prevHybRecopy = rc; st.prevHybAsync = as;
+    Appendf(s, "  fix Hybrid: ON | mirrors %llu (%.0f MB), retired %llu | binds%s: VB %.1f, IB %.1f, left on sysmem %.1f"
+               " | SRV: alias %.1f, twin %.1f, left %.1f, new ranges %.1f (%.2f MB) | copies%s: submissions %.2f%s,"
+               " regions %.1f, %.2f MB (referenced %.2f MB, of it already this frame %.2f MB) | twins live %llu (made %llu)",
+            g_hybHeaps.load() - g_hybRetired.load(), MB(g_hybLiveBytes.load()), g_hybRetired.load(), per,
+            dMisc[M_HYB_VB] / div, dMisc[M_HYB_IB] / div, dMisc[M_HYB_SKIP] / div,
+            dMisc[M_HYB_SRV_ALIAS] / div, dMisc[M_HYB_SRV_TWIN] / div, dMisc[M_HYB_SRV_SKIP] / div,
+            dSq / div, MB(dSqb) / div, per, dInj / div, dAs ? " (COPY queue)" : "", dReg / div, MB(dBy) / div,
+            MB(dUn) / div, MB(dRc) / div, g_hybTwinsLive.load(), g_hybTwinsTotal.load());
+    if (!g_hybRedirect.load()) Appendf(s, " | REDIRECTS DISABLED (copy failure, see log)");
+    if (g_hybBadLayout.load()) Appendf(s, " | VA layout check FAILED for %llu heap(s)", g_hybBadLayout.load());
+    if (g_hybFailed.load()) Appendf(s, " | mirror creation failed %llu", g_hybFailed.load());
+    if (g_hybTwinFail.load()) Appendf(s, " | twin creation failed %llu", g_hybTwinFail.load());
+    if (g_cfg.hybridNoCopy) Appendf(s, " | TEST: COPIES DISABLED");
+    Appendf(s, "\n");
+    if (!g_cfg.hybridCheck) return;
+    HcStats h;
+    size_t watched;
+    {
+        std::lock_guard<std::mutex> lk(g_fixMutex);
+        h = g_hc;
+        g_hc = HcStats();
+        watched = g_hcList.size();
+    }
+    uint64_t age[HA_COUNT][2] = {}, srvSize[4] = {}, total = 0;
+    for (int a = 0; a < HA_COUNT; ++a)
+        for (int v = 0; v < 2; ++v)
+            for (int z = 0; z < 4; ++z) {
+                age[a][v] += h.stale[a][v][z];
+                if (v) srvSize[z] += h.stale[a][v][z];
+                total += h.stale[a][v][z];
+            }
+    Appendf(s, "  hybrid check%s: watched %zu, hashed %.1f (%.2f ms), copied %.1f (%.2f MB), of them unchanged since their"
+               " last copy %.1f (%.2f MB) | STALE (changed after last copy, no new"
+               " reference; repaired) %.2f: with SRV new/last frame/older %.2f/%.2f/%.2f, without SRV %.2f/%.2f/%.2f |"
+               " SRV ones by size <4K %.2f, <64K %.2f, <1M %.2f, >=1M %.2f | at death: changed %llu of %llu\n",
+            per, watched, h.hashed / div, h.ms / div, h.copied / div, MB(h.copiedBytes) / div, h.redundant / div,
+            MB(h.redundantBytes) / div, total / div,
+            age[HA_NEW][1] / div, age[HA_PREV][1] / div, age[HA_OLD][1] / div,
+            age[HA_NEW][0] / div, age[HA_PREV][0] / div, age[HA_OLD][0] / div,
+            srvSize[0] / div, srvSize[1] / div, srvSize[2] / div, srvSize[3] / div, h.deathChanged, h.deathChecked);
+}
 
 // CPU time per thread of this process since the last block (user + kernel),
 // top threads by time. GetThreadTimes is tick-based, fine over a 5 s window.
@@ -2356,6 +3252,7 @@ static void DumpStats(StatsState& st)
                        " NVAPI failed %llu, window full %llu\n",
                     MB(g_vidLiveBytes.load()), g_vidHeaps.load(), g_vidBufs.load(),
                     g_vidNoRoom.load(), g_vidFailed.load(), g_vidIgnored.load());
+        AppendHybStats(s, st, dMisc, div, per);
         AppendThreadCpu(s, st, div, per);
         LogRaw(s.c_str());
         return;
@@ -2386,6 +3283,7 @@ static void DumpStats(StatsState& st)
                 MB(g_vidLiveBytes.load()), g_vidHeaps.load(), MB(g_vidHeapBytes.load()),
                 g_vidBufs.load(), MB(g_vidBufBytes.load()), g_vidUnverified.load(), g_vidNoRoom.load(), g_vidFailed.load(),
                 g_vidIgnored.load());
+    AppendHybStats(s, st, dMisc, div, per);
 
     if (g_cfg.gpuTiming) {
         GpuAgg g;
@@ -2755,15 +3653,61 @@ static void CheckListVtable(ID3D12GraphicsCommandList* cl)
     ApplyHooks();
 }
 
+// Temporary queues and command lists, only to reach their vtables and hook
+// ExecuteCommandLists and the command list methods (caller holds g_installMutex;
+// hooks are queued, not enabled yet, so these creations are not recorded).
+static void InstallQueueAndListHooks(ID3D12Device* dev)
+{
+    static const D3D12_COMMAND_LIST_TYPE kQueueTypes[] = {
+        D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY };
+    for (int i = 0; i < 3; ++i) {
+        D3D12_COMMAND_QUEUE_DESC qd = {};
+        qd.Type = kQueueTypes[i];
+        ID3D12CommandQueue* q = nullptr;
+        HRESULT hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+        if (FAILED(hr) || !q) { Log("  temp %s queue failed: 0x%08lx", ListTypeName(qd.Type), hr); continue; }
+        InstallForType<QueueHooks>(i, *reinterpret_cast<void***>(q), ListTypeName(qd.Type));
+        q->Release();
+    }
+    static const D3D12_COMMAND_LIST_TYPE kListTypes[] = {
+        D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY,
+        D3D12_COMMAND_LIST_TYPE_BUNDLE };
+    for (int i = 0; i < 4; ++i) {
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* cl = nullptr;
+        HRESULT hr = dev->CreateCommandAllocator(kListTypes[i], IID_PPV_ARGS(&alloc));
+        if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, kListTypes[i], alloc, nullptr, IID_PPV_ARGS(&cl));
+        if (FAILED(hr) || !cl) {
+            Log("  temp %s command list failed: 0x%08lx", ListTypeName(kListTypes[i]), hr);
+        } else {
+            void** lvt = *reinterpret_cast<void***>(cl);
+            Log("  temp %s command list vtable %s", ListTypeName(kListTypes[i]), DescribeAddr(lvt).c_str());
+            InstallForType<ListHooks>(i, lvt, ListTypeName(kListTypes[i]));
+            RememberListTargets(lvt);
+            g_listVariantsUsed = i + 1;
+            cl->Close();
+            cl->Release();
+        }
+        if (alloc) alloc->Release();
+    }
+}
+
 static void InstallDeviceHooks(ID3D12Device* dev)
 {
     std::lock_guard<std::recursive_mutex> lk(g_installMutex);
     void** vt = *reinterpret_cast<void***>(dev);
     if (!g_cfg.measure) {
-        // Fix-only mode ([General] Measure=0): just the creation calls stage 2c needs.
-        Log("installing device hooks (fix-only mode: no binding/draw/submit hooks, no measurement)");
+        // Fix-only mode ([General] Measure=0): just the calls stage 2c / 2d need.
+        Log("installing device hooks (fix-only mode: no measurement%s)",
+            g_cfg.hybridHeaps ? "; stage 2d: placed resources, SRVs, VB/IB, list Reset/Close, ExecuteCommandLists"
+                              : ": no binding/draw/submit hooks");
         HookVT(vt, g_vtbl.Device_CreateCommittedResource, (void*)&Hook_CCR, (void**)&o_CCR, "Device::CreateCommittedResource");
         HookVT(vt, g_vtbl.Device_CreateHeap, (void*)&Hook_CH, (void**)&o_CH, "Device::CreateHeap");
+        if (g_cfg.hybridHeaps) {
+            HookVT(vt, g_vtbl.Device_CreatePlacedResource, (void*)&Hook_CPR, (void**)&o_CPR, "Device::CreatePlacedResource");
+            if (g_cfg.hybridSrv)
+                HookVT(vt, g_vtbl.Device_CreateShaderResourceView, (void*)&Hook_CSRV, (void**)&o_CSRV, "Device::CreateShaderResourceView");
+        }
         ID3D12Device4* m4 = nullptr;
         if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&m4))) && m4) {
             void** v4 = *reinterpret_cast<void***>(m4);
@@ -2775,7 +3719,18 @@ static void InstallDeviceHooks(ID3D12Device* dev)
         if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&m8))) && m8) {
             void** v8 = *reinterpret_cast<void***>(m8);
             HookVT(v8, g_vtbl.Device8_CreateCommittedResource2, (void*)&Hook_CCR2, (void**)&o_CCR2, "Device8::CreateCommittedResource2");
+            if (g_cfg.hybridHeaps)
+                HookVT(v8, g_vtbl.Device8_CreatePlacedResource1, (void*)&Hook_CPR1, (void**)&o_CPR1, "Device8::CreatePlacedResource1");
             m8->Release();
+        }
+        if (g_cfg.hybridHeaps) {
+            ID3D12Device10* m10 = nullptr;
+            if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&m10))) && m10) {
+                void** v10 = *reinterpret_cast<void***>(m10);
+                HookVT(v10, g_vtbl.Device10_CreatePlacedResource2, (void*)&Hook_CPR2, (void**)&o_CPR2, "Device10::CreatePlacedResource2");
+                m10->Release();
+            }
+            InstallQueueAndListHooks(dev);
         }
         ApplyHooks();
         Log("device hooks installed");
@@ -2809,42 +3764,7 @@ static void InstallDeviceHooks(ID3D12Device* dev)
         HookVT(v10, g_vtbl.Device10_CreatePlacedResource2, (void*)&Hook_CPR2, (void**)&o_CPR2, "Device10::CreatePlacedResource2");
         d10->Release();
     }
-
-    // Temporary objects, only to reach the queue / command list vtables.
-    // (Hooks are queued, not enabled yet, so these creations are not recorded.)
-    static const D3D12_COMMAND_LIST_TYPE kQueueTypes[] = {
-        D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY };
-    for (int i = 0; i < 3; ++i) {
-        D3D12_COMMAND_QUEUE_DESC qd = {};
-        qd.Type = kQueueTypes[i];
-        ID3D12CommandQueue* q = nullptr;
-        HRESULT hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
-        if (FAILED(hr) || !q) { Log("  temp %s queue failed: 0x%08lx", ListTypeName(qd.Type), hr); continue; }
-        InstallForType<QueueHooks>(i, *reinterpret_cast<void***>(q), ListTypeName(qd.Type));
-        q->Release();
-    }
-    static const D3D12_COMMAND_LIST_TYPE kListTypes[] = {
-        D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE, D3D12_COMMAND_LIST_TYPE_COPY,
-        D3D12_COMMAND_LIST_TYPE_BUNDLE };
-    for (int i = 0; i < 4; ++i) {
-        ID3D12CommandAllocator* alloc = nullptr;
-        ID3D12GraphicsCommandList* cl = nullptr;
-        HRESULT hr = dev->CreateCommandAllocator(kListTypes[i], IID_PPV_ARGS(&alloc));
-        if (SUCCEEDED(hr)) hr = dev->CreateCommandList(0, kListTypes[i], alloc, nullptr, IID_PPV_ARGS(&cl));
-        if (FAILED(hr) || !cl) {
-            Log("  temp %s command list failed: 0x%08lx", ListTypeName(kListTypes[i]), hr);
-        } else {
-            void** lvt = *reinterpret_cast<void***>(cl);
-            Log("  temp %s command list vtable %s", ListTypeName(kListTypes[i]), DescribeAddr(lvt).c_str());
-            InstallForType<ListHooks>(i, lvt, ListTypeName(kListTypes[i]));
-            RememberListTargets(lvt);
-            g_listVariantsUsed = i + 1;
-            cl->Close();
-            cl->Release();
-        }
-        if (alloc) alloc->Release();
-    }
-
+    InstallQueueAndListHooks(dev);
     ApplyHooks();
     Log("device hooks installed");
 }

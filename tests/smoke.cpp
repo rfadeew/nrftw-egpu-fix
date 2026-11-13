@@ -10,8 +10,19 @@
 //            used as VB + root SRV by real draws, results checked. Covers
 //            stage 2c ([Fix] VidmemHeaps=1). Then a benchmark: 8 MB vertex
 //            fetch + CPU write/read speed, UPLOAD heap vs a sysmem reference heap.
-// Usage: smoke.exe [phase1 frames] [phase2 frames] [phase3 frames] [break]
+//   Phase 4: stage 2d ([Fix] HybridHeaps / HybridSrv / HybridCheck): per-frame
+//            buffers in 32 MB UPLOAD heaps read as VB and through descriptor-
+//            table SRVs (raw, structured stride 12, typed; created in a CPU
+//            heap, copied into a shader-visible one), two submissions per
+//            frame, SRVs created before their data is written, a buffer
+//            destroyed and recreated at the same offset, a second heap, and a
+//            "persistent" buffer rewritten in place every frame behind an SRV
+//            created once. That last one MUST read stale data with HybridSrv=1
+//            and no HybridCheck (checked from build\egpu_fix.ini), and must be
+//            repaired with HybridCheck=1 (Measure=1).
+// Usage: smoke.exe [phase1 frames] [phase2 frames] [phase3 frames] [phase4 frames] [break]
 //        "break" skips one VB write in phase 3 (negative test: must FAIL).
+//        [Fix] HybridTestNoCopy=1 in the ini is the stage 2d negative test (must FAIL).
 // Exit code 0 = all checks passed.
 // Check build\egpu_proxy.log afterwards.
 #include <windows.h>
@@ -23,6 +34,12 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "user32.lib")
+
+// Agility SDK like the game (1.618): with build\D3D12\D3D12Core.dll present (copy it from
+// <game>\D3D12\) phase 4 uses tight-aligned buffers (D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT,
+// 4 KB offsets) like the game's; without it the OS runtime is used and they are skipped.
+extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 618; }
+extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
 
 #define CHECK(x) do { HRESULT hr_ = (x); if (FAILED(hr_)) { printf("FAILED 0x%08lx: %s (line %d)\n", hr_, #x, __LINE__); return 1; } } while (0)
 
@@ -76,10 +93,29 @@ uint PSVb(VbOut i) : SV_Target { return i.val; }
 float4 VSBench(float4 v : POS) : SV_Position { return float4(2.0 + abs(v.x) + abs(v.y) + abs(v.z) + abs(v.w), 0, 0, 1); }
 )";
 
-static ID3DBlob* Compile(const char* entry, const char* target)
+// Phase 4 (shader model 5.1: register spaces): VB value ^ raw ^ structured (stride 12) ^ typed
+// ^ "persistent" buffer, all four SRVs from one descriptor table.
+static const char kHlsl4[] = R"(
+struct VbOut { float4 pos : SV_Position; nointerpolation uint val : VAL; };
+uint PSVb(VbOut i) : SV_Target { return i.val; }
+ByteAddressBuffer       d4raw : register(t0, space1);
+StructuredBuffer<uint3> d4st  : register(t1, space1);
+Buffer<uint>            d4ty  : register(t2, space1);
+ByteAddressBuffer       d4p   : register(t3, space1);
+VbOut VSDesc(uint val : VAL, uint id : SV_VertexID)
+{
+    VbOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.val = val ^ d4raw.Load(0) ^ d4st[0].y ^ d4ty[0] ^ d4p.Load(0);
+    return o;
+}
+)";
+
+static ID3DBlob* Compile(const char* entry, const char* target, const char* src = kHlsl)
 {
     ID3DBlob* code = nullptr; ID3DBlob* err = nullptr;
-    if (FAILED(D3DCompile(kHlsl, sizeof(kHlsl) - 1, "smoke.hlsl", nullptr, nullptr, entry, target, 0, 0, &code, &err))) {
+    if (FAILED(D3DCompile(src, strlen(src), "smoke.hlsl", nullptr, nullptr, entry, target, 0, 0, &code, &err))) {
         printf("shader %s failed: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
         return nullptr;
     }
@@ -731,6 +767,285 @@ int wmain(int argc, wchar_t** argv)
                    benchName[h], gpuMin[h], gpuSum[h] / kIters, 8.0 / (gpuMin[h] / 1000.0), wrBest[h], rdMBs[h]);
         VirtualFree(srcData, 0, MEM_RELEASE);
         benchRes[0]->Release(); benchRes[1]->Release();
+        // Release the heaps (GPU is idle): stage 2d must retire upHeap's mirror during phase 4 (see the log).
+        upHeap->Release(); sysHeap->Release();
+    }
+    if (dev->GetDeviceRemovedReason() != S_OK) { printf("DEVICE REMOVED 0x%08lx\n", dev->GetDeviceRemovedReason()); return 1; }
+
+    // ============ Phase 4: stage 2d, SRVs through descriptor tables ============
+    const int frames4 = argc > 4 && _wtoi(argv[4]) > 0 ? _wtoi(argv[4]) : 60;
+    {
+        // What the DLL is configured to do (it reads the same ini): which failures are expected.
+        wchar_t ini[MAX_PATH];
+        GetModuleFileNameW(nullptr, ini, MAX_PATH);
+        wcscpy_s(wcsrchr(ini, L'\\') + 1, 64, L"egpu_fix.ini");
+        auto iniInt = [&](const wchar_t* sec, const wchar_t* key, int def) { return (int)GetPrivateProfileIntW(sec, key, def, ini); };
+        const bool hooksOn = iniInt(L"General", L"Hooks", 1) != 0;
+        const bool measure = iniInt(L"General", L"Measure", 0) != 0;
+        // The smoke heaps fit into the CPU-visible VRAM window, so with VidmemHeaps=1 stage 2c takes them all.
+        const bool hyb = hooksOn && iniInt(L"Fix", L"HybridHeaps", 0) && !iniInt(L"Fix", L"VidmemHeaps", 1);
+        const bool hybSrv = hyb && iniInt(L"Fix", L"HybridSrv", 0);
+        const bool hybCheck = hyb && measure && iniInt(L"Fix", L"HybridCheck", 0);
+        const bool noCopy = hyb && iniInt(L"Fix", L"HybridTestNoCopy", 0);
+        const bool expectPStale = hybSrv && !hybCheck && !noCopy;
+        printf("phase 4: ini says hybrid %d, SRV %d, check %d, no-copy test %d -> persistent buffer %s\n",
+               hyb, hybSrv, hybCheck, noCopy, expectPStale ? "MUST read stale data" : "must read fresh data");
+
+        ID3DBlob* vsD = Compile("VSDesc", "vs_5_1", kHlsl4);
+        ID3DBlob* psD = Compile("PSVb", "ps_5_1", kHlsl4);
+        if (!vsD || !psD) return 1;
+        D3D12_DESCRIPTOR_RANGE range = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 1, 0 };
+        D3D12_ROOT_PARAMETER rp4 = {};
+        rp4.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp4.DescriptorTable = { 1, &range };
+        D3D12_ROOT_SIGNATURE_DESC rsd4 = { 1, &rp4, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT };
+        ID3DBlob* blob4 = nullptr;
+        CHECK(D3D12SerializeRootSignature(&rsd4, D3D_ROOT_SIGNATURE_VERSION_1, &blob4, nullptr));
+        ID3D12RootSignature* rs4 = nullptr;
+        CHECK(dev->CreateRootSignature(0, blob4->GetBufferPointer(), blob4->GetBufferSize(), IID_PPV_ARGS(&rs4)));
+        D3D12_INPUT_ELEMENT_DESC il[] = { { "VAL", 0, DXGI_FORMAT_R32_UINT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 } };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC g4 = gp;
+        g4.pRootSignature = rs4;
+        g4.VS = { vsD->GetBufferPointer(), vsD->GetBufferSize() };
+        g4.PS = { psD->GetBufferPointer(), psD->GetBufferSize() };
+        g4.InputLayout = { il, 1 };
+        ID3D12PipelineState* pso4 = nullptr;
+        CHECK(dev->CreateGraphicsPipelineState(&g4, IID_PPV_ARGS(&pso4)));
+
+        // Layout of each 64 KB per-frame buffer; slot s = draw k / kB4.
+        const UINT kDyn4 = 256, kB4 = 16, kP4 = 32;              // main draws, buffers per frame, persistent draws
+        const UINT64 kBuf4 = 64 << 10;
+        const UINT64 kRawOff = 16 << 10, kStOff = 12 * 2731, kTyOff = 48 << 10, kPvbOff = 60 << 10;
+        const UINT64 kRing4 = 24ull << 20, kPOff = 28ull << 20;  // ring [0, 24 MB), persistent buffer at 28 MB
+        auto rawVal = [](UINT seed, UINT k) { return Val(seed ^ 0x1111u, k); };
+        auto stVal = [](UINT seed, UINT k) { return Val(seed ^ 0x2222u, k); };
+        auto tyVal = [](UINT seed, UINT k) { return Val(seed ^ 0x3333u, k); };
+        auto pvbVal = [](UINT seed, UINT j) { return Val(seed ^ 0x4444u, j); };
+        auto pVal = [](int fr) { return Val(0xabcdefu, (UINT)fr + 1); };
+
+        D3D12_HEAP_DESC hd4 = {};
+        hd4.SizeInBytes = 32ull << 20; hd4.Alignment = 4ull << 20;
+        hd4.Properties.Type = D3D12_HEAP_TYPE_UPLOAD; hd4.Flags = D3D12_HEAP_FLAG_NONE;
+        ID3D12Heap* heapA = nullptr;
+        ID3D12Heap* heapB = nullptr; // second heap, from the middle of the phase
+        CHECK(dev->CreateHeap(&hd4, IID_PPV_ARGS(&heapA)));
+        bool tight = false; // tight-aligned buffers (Agility runtime): 4 KB offsets like the game's
+        auto place4 = [&](ID3D12Heap* h, UINT64 off, UINT64 size) -> ID3D12Resource* {
+            D3D12_RESOURCE_DESC d = {};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d.Width = size; d.Height = 1; d.DepthOrArraySize = 1;
+            d.MipLevels = 1; d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (tight) d.Flags = (D3D12_RESOURCE_FLAGS)0x400; // D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT
+            ID3D12Resource* r = nullptr;
+            HRESULT hr = dev->CreatePlacedResource(h, off, &d, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&r));
+            if (FAILED(hr)) printf("phase 4: CreatePlacedResource(off %llu) failed 0x%08lx\n", off, hr);
+            return r;
+        };
+        {
+            D3D12_RESOURCE_DESC d = {};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d.Width = 608; d.Height = 1; d.DepthOrArraySize = 1;
+            d.MipLevels = 1; d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            d.Flags = (D3D12_RESOURCE_FLAGS)0x400;
+            ID3D12Resource* r = nullptr;
+            tight = SUCCEEDED(dev->CreatePlacedResource(heapA, 31ull << 20, &d, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                        nullptr, IID_PPV_ARGS(&r))) && r;
+            if (r) r->Release();
+            printf("phase 4: tight-aligned buffers %s\n", tight ? "ON (Agility runtime), 4 KB offsets"
+                                                              : "not supported (no build\\D3D12\\D3D12Core.dll), 64 KB offsets");
+        }
+        // Buffer b of a frame: ring + b * stride (+ 4 KB for odd b with tight alignment).
+        const UINT64 kStride4 = tight ? 72 << 10 : 64 << 10;
+        auto bufOff = [&](UINT64 ring, UINT b) { return ring + b * kStride4 + (tight && (b & 1) ? 0x1000 : 0); };
+
+        // Descriptors: CPU heap (created there) -> shader-visible heap (copied), like an engine does.
+        const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        const UINT nDesc = kDyn4 * 4 + 4;                         // a table per main draw + one table for the P draws
+        D3D12_DESCRIPTOR_HEAP_DESC cpuHd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, nDesc + 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE };
+        D3D12_DESCRIPTOR_HEAP_DESC gpuHd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, nDesc, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
+        ID3D12DescriptorHeap* cpuHeap = nullptr;
+        ID3D12DescriptorHeap* gpuHeap = nullptr;
+        CHECK(dev->CreateDescriptorHeap(&cpuHd, IID_PPV_ARGS(&cpuHeap)));
+        CHECK(dev->CreateDescriptorHeap(&gpuHd, IID_PPV_ARGS(&gpuHeap)));
+        auto cpuH = [&](UINT i) { D3D12_CPU_DESCRIPTOR_HANDLE h = cpuHeap->GetCPUDescriptorHandleForHeapStart(); h.ptr += (SIZE_T)i * inc; return h; };
+        auto gpuH = [&](UINT i) { D3D12_GPU_DESCRIPTOR_HANDLE h = gpuHeap->GetGPUDescriptorHandleForHeapStart(); h.ptr += (UINT64)i * inc; return h; };
+        auto rawDesc = [](UINT64 byteOff, UINT n) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+            d.Format = DXGI_FORMAT_R32_TYPELESS; d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            d.Buffer.FirstElement = byteOff / 4; d.Buffer.NumElements = n; d.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            return d;
+        };
+        auto stDesc = [](UINT64 first) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+            d.Format = DXGI_FORMAT_UNKNOWN; d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            d.Buffer.FirstElement = first; d.Buffer.NumElements = 1; d.Buffer.StructureByteStride = 12;
+            return d;
+        };
+        auto tyDesc = [](UINT64 first) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC d = {};
+            d.Format = DXGI_FORMAT_R32_UINT; d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            d.Buffer.FirstElement = first; d.Buffer.NumElements = 1;
+            return d;
+        };
+        // Null descriptors fill the unused slots of a table (they read 0).
+        auto nullSrvs = [&](UINT base, bool raw, bool st, bool ty, bool p) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC d;
+            if (raw) { d = rawDesc(0, 4); dev->CreateShaderResourceView(nullptr, &d, cpuH(base + 0)); }
+            if (st)  { d = stDesc(0);     dev->CreateShaderResourceView(nullptr, &d, cpuH(base + 1)); }
+            if (ty)  { d = tyDesc(0);     dev->CreateShaderResourceView(nullptr, &d, cpuH(base + 2)); }
+            if (p)   { d = rawDesc(0, 4); dev->CreateShaderResourceView(nullptr, &d, cpuH(base + 3)); }
+        };
+
+        // Persistent buffer P: SRV created once (its own CPU slot nDesc), rewritten in place every frame.
+        ID3D12Resource* P = place4(heapA, kPOff, kBuf4);
+        if (!P) return 1;
+        BYTE* pMap = nullptr;
+        CHECK(P->Map(0, nullptr, (void**)&pMap));
+        *(UINT*)pMap = pVal(-1);
+        { D3D12_SHADER_RESOURCE_VIEW_DESC d = rawDesc(0, 4); dev->CreateShaderResourceView(P, &d, cpuH(nDesc)); }
+
+        UINT64 ringOff = 0;
+        int mainBad = 0, pStale = 0, pWrongOther = 0;
+        for (int fr = 0; fr < frames4; ++fr) {
+            if (fr == frames4 / 2) { CHECK(dev->CreateHeap(&hd4, IID_PPV_ARGS(&heapB))); ringOff = 0; printf("phase 4: second heap\n"); }
+            ID3D12Heap* heap = heapB ? heapB : heapA;
+            if (ringOff + kB4 * kStride4 + 0x1000 > kRing4) ringOff = 0;
+            const UINT seed = 0x7654321u + (UINT)fr * 104729u;
+            ID3D12Resource* bufs[kB4] = {};
+            BYTE* mp[kB4] = {};
+            for (UINT b = 0; b < kB4; ++b) {
+                const UINT64 off = bufOff(ringOff, b);
+                if (b == 2) {
+                    // A buffer with an SRV that dies, then another one at the same offset.
+                    ID3D12Resource* decoy = place4(heap, off, kBuf4);
+                    if (!decoy) return 1;
+                    D3D12_SHADER_RESOURCE_VIEW_DESC d = stDesc(1);
+                    dev->CreateShaderResourceView(decoy, &d, cpuH(nDesc - 1)); // P table slot, overwritten below
+                    decoy->Release();
+                }
+                bufs[b] = place4(heap, off, kBuf4);
+                if (!bufs[b]) return 1;
+                CHECK(bufs[b]->Map(0, nullptr, (void**)&mp[b]));
+            }
+            auto writeDraw = [&](UINT k) {
+                const UINT b = k % kB4, s = k / kB4;
+                UINT* v = (UINT*)(mp[b] + s * 256);
+                v[0] = v[1] = v[2] = Val(seed, k);
+                *(UINT*)(mp[b] + kRawOff + s * 256) = rawVal(seed, k);
+                *(UINT*)(mp[b] + kStOff + 24 * s + 4) = stVal(seed, k);
+                *(UINT*)(mp[b] + kTyOff + s * 256) = tyVal(seed, k);
+            };
+            // First half of the data now, then all SRVs, the second half only after the first submission.
+            for (UINT k = 0; k < kDyn4 / 2; ++k) writeDraw(k);
+            for (UINT j = 0; j < kP4; ++j) {
+                UINT* v = (UINT*)(mp[j % kB4] + kPvbOff + (j / kB4) * 256);
+                v[0] = v[1] = v[2] = pvbVal(seed, j);
+            }
+            for (UINT k = 0; k < kDyn4; ++k) {
+                const UINT b = k % kB4, s = k / kB4;
+                D3D12_SHADER_RESOURCE_VIEW_DESC d = rawDesc(kRawOff + s * 256, 4);
+                dev->CreateShaderResourceView(bufs[b], &d, cpuH(k * 4 + 0));
+                d = stDesc((kStOff + 24 * s) / 12);
+                dev->CreateShaderResourceView(bufs[b], &d, cpuH(k * 4 + 1));
+                d = tyDesc((kTyOff + s * 256) / 4);
+                dev->CreateShaderResourceView(bufs[b], &d, cpuH(k * 4 + 2));
+                nullSrvs(k * 4, false, false, false, true);
+            }
+            nullSrvs(kDyn4 * 4, true, true, true, false);
+            dev->CopyDescriptorsSimple(1, cpuH(kDyn4 * 4 + 3), cpuH(nDesc), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            {
+                D3D12_CPU_DESCRIPTOR_HANDLE dst = gpuHeap->GetCPUDescriptorHandleForHeapStart();
+                dev->CopyDescriptorsSimple(nDesc, dst, cpuH(0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
+
+            auto record = [&](ID3D12GraphicsCommandList* c, ID3D12CommandAllocator* a, UINT k0, UINT k1, bool last) -> HRESULT {
+                HRESULT hr = a->Reset();
+                if (SUCCEEDED(hr)) hr = c->Reset(a, pso4);
+                if (FAILED(hr)) return hr;
+                c->SetGraphicsRootSignature(rs4);
+                c->SetDescriptorHeaps(1, &gpuHeap);
+                c->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                const D3D12_RECT sr = { 0, 0, (LONG)kW, (LONG)kH };
+                c->RSSetScissorRects(1, &sr);
+                c->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                for (UINT k = k0; k < k1; ++k) {
+                    const UINT b = k % kB4, s = k / kB4;
+                    const D3D12_VIEWPORT vp = { (float)(k % kW), (float)(k / kW), 1.0f, 1.0f, 0.0f, 1.0f };
+                    c->RSSetViewports(1, &vp);
+                    const D3D12_VERTEX_BUFFER_VIEW vbv = { bufs[b]->GetGPUVirtualAddress() + s * 256, 12, 4 };
+                    c->IASetVertexBuffers(0, 1, &vbv);
+                    c->SetGraphicsRootDescriptorTable(0, gpuH(k * 4));
+                    c->DrawInstanced(3, 1, 0, 0);
+                }
+                if (last) {
+                    c->SetGraphicsRootDescriptorTable(0, gpuH(kDyn4 * 4));
+                    for (UINT j = 0; j < kP4; ++j) {
+                        const UINT k = kDyn4 + j;
+                        const D3D12_VIEWPORT vp = { (float)(k % kW), (float)(k / kW), 1.0f, 1.0f, 0.0f, 1.0f };
+                        c->RSSetViewports(1, &vp);
+                        const D3D12_VERTEX_BUFFER_VIEW vbv = { bufs[j % kB4]->GetGPUVirtualAddress() + kPvbOff + (j / kB4) * 256, 12, 4 };
+                        c->IASetVertexBuffers(0, 1, &vbv);
+                        c->DrawInstanced(3, 1, 0, 0);
+                    }
+                    D3D12_RESOURCE_BARRIER b1 = Transition(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    c->ResourceBarrier(1, &b1);
+                    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+                    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = fp;
+                    src.pResource = rt; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+                    c->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                    D3D12_RESOURCE_BARRIER b2 = Transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                    c->ResourceBarrier(1, &b2);
+                }
+                return c->Close();
+            };
+            CHECK(record(L[0], al[0], 0, kDyn4 / 2, false));
+            { ID3D12CommandList* sub[] = { L[0] }; q->ExecuteCommandLists(1, sub); }
+            // Once the first submission has run on the GPU (its mirror copies are done; without the
+            // wait they may still pick up what we write next): the rest of the data, and P rewritten
+            // in place (no new SRV, no VB use).
+            waitIdle();
+            for (UINT k = kDyn4 / 2; k < kDyn4; ++k) writeDraw(k);
+            *(UINT*)pMap = pVal(fr);
+            CHECK(record(L[1], al[1], kDyn4 / 2, kDyn4, true));
+            { ID3D12CommandList* sub[] = { L[1] }; q->ExecuteCommandLists(1, sub); }
+            CHECK(sc->Present(0, 0));
+            waitIdle();
+
+            BYTE* m = nullptr;
+            CHECK(rb->Map(0, nullptr, (void**)&m));
+            auto px = [&](UINT k) { return *(const UINT*)(m + fp.Offset + (k / kW) * fp.Footprint.RowPitch + (k % kW) * 4); };
+            int bad = 0;
+            for (UINT k = 0; k < kDyn4; ++k) {
+                const UINT want = Val(seed, k) ^ rawVal(seed, k) ^ stVal(seed, k) ^ tyVal(seed, k);
+                if (px(k) != want && bad++ < 4) printf("  phase 4 frame %d: draw %u got 0x%08x want 0x%08x\n", fr, k, px(k), want);
+            }
+            int pFresh = 0, pOld = 0; // P read this frame's value / an earlier frame's value
+            for (UINT j = 0; j < kP4; ++j) {
+                const UINT got = px(kDyn4 + j) ^ pvbVal(seed, j);
+                if (got == pVal(fr)) { ++pFresh; continue; }
+                for (int f = -1; f < fr; ++f) if (got == pVal(f)) { ++pOld; break; }
+            }
+            D3D12_RANGE none = { 0, 0 };
+            rb->Unmap(0, &none);
+            if (bad) { ++mainBad; printf("phase 4 frame %d: %d mismatches\n", fr, bad); }
+            if (pFresh != (int)kP4) {
+                if (pOld == (int)kP4) ++pStale; else ++pWrongOther;
+            }
+            for (UINT b = 0; b < kB4; ++b) bufs[b]->Release();
+            ringOff += kB4 * kStride4 + (64 << 10); // shift the ring phase (offset mod 12 varies: alias and twin SRVs)
+        }
+        P->Release();
+        heapA->Release();
+        if (heapB) heapB->Release();
+        int fail4 = mainBad + pWrongOther;
+        const bool pOk = expectPStale ? pStale > 0 : pStale == 0;
+        if (!pOk) ++fail4;
+        failures += fail4;
+        printf("phase 4: %d frames: main draws failed in %d, persistent buffer stale in %d frame(s), other P errors %d"
+               " -> %s%s\n", frames4, mainBad, pStale, pWrongOther,
+               pOk ? "as expected" : expectPStale ? "NOT STALE: SRV redirect not active?" : "STALE: SRV mirror not refreshed",
+               noCopy ? " (no-copy test mode: failures expected)" : "");
     }
     if (dev->GetDeviceRemovedReason() != S_OK) { printf("DEVICE REMOVED 0x%08lx\n", dev->GetDeviceRemovedReason()); return 1; }
 
