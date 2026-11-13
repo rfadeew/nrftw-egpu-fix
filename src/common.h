@@ -28,6 +28,20 @@ struct Config {
     int  vidmemReserveMB  = 32;    // [Fix] VidmemReserveMB: CPU-visible VRAM always left free (if the driver reports it)
     int  vidmemCapMB      = 192;   // [Fix] VidmemCapMB: max of our live CPU-visible VRAM (window ~192 MB free on this system)
     bool vidmemWithReBAR  = false; // [Fix] VidmemWithReBAR: also run stage 2c when the GPU has ReBAR (untested)
+    bool hybridHeaps      = false; // [Fix] HybridHeaps: UPLOAD heaps not placed in VRAM by 2c get a DEFAULT mirror (stage 2d)
+    bool hybridSrv        = false; // [Fix] HybridSrv: also redirect buffer SRV descriptors into the mirror
+    int  hybridSrvCopies  = 2;     // [Fix] HybridSrvCopies: game submissions at which a new SRV's range is copied
+    int  hybridMergeKB    = 16;    // [Fix] HybridMergeKB: copy ranges closer than this are merged into one copy
+    bool hybridCopyQueue  = false; // [Fix] HybridCopyQueue: copies on our own COPY queue, overlapping the game's rendering
+    bool hybridCheck      = false; // [Fix] HybridCheck: hash mirrored buffers, count/repair stale mirror data (Measure=1 only)
+    bool hybridNoCopy     = false; // [Fix] HybridTestNoCopy: redirect but never copy (negative test, must break rendering)
+    bool shadowHeaps      = false; // [Fix] ShadowHeaps: UPLOAD heaps live in VRAM, CPU writes go to a sysmem shadow (stage 2e)
+    int  shadowMergeKB    = 16;    // [Fix] ShadowMergeKB: dirty ranges closer than this are merged into one copy
+    int  shadowStreamUs   = 0;     // [Fix] ShadowStreamUs: background flush period in us (0 = off, else 200..20000)
+    int  shadowStreamMinKB = 64;   // [Fix] ShadowStreamMinKB: a background round copies only if at least this much is dirty
+    bool shadowStreamAll  = false; // [Fix] ShadowStreamAllHeaps: background rounds scan every heap, not only the hot ones
+    int  shadowStreamMaxInFlight = 2; // [Fix] ShadowStreamMaxInFlight: background rounds skipped while this many copies are pending
+    bool shadowNoCopy     = false; // [Fix] ShadowTestNoCopy: never copy shadow -> VRAM (negative test, must break rendering)
 };
 extern Config g_cfg;
 

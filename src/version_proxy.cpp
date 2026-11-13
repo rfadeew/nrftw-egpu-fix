@@ -104,11 +104,42 @@ static void ReadConfig(const wchar_t* ini)
     g_cfg.vidmemReserveMB  = IniInt(L"Fix", L"VidmemReserveMB", d.vidmemReserveMB, ini);
     g_cfg.vidmemCapMB      = IniInt(L"Fix", L"VidmemCapMB", d.vidmemCapMB, ini);
     g_cfg.vidmemWithReBAR  = IniBool(L"Fix", L"VidmemWithReBAR", d.vidmemWithReBAR, ini);
+    g_cfg.hybridHeaps      = IniBool(L"Fix", L"HybridHeaps", d.hybridHeaps, ini);
+    g_cfg.hybridSrv        = IniBool(L"Fix", L"HybridSrv", d.hybridSrv, ini);
+    g_cfg.hybridSrvCopies  = IniInt(L"Fix", L"HybridSrvCopies", d.hybridSrvCopies, ini);
+    g_cfg.hybridMergeKB    = IniInt(L"Fix", L"HybridMergeKB", d.hybridMergeKB, ini);
+    g_cfg.hybridCopyQueue  = IniBool(L"Fix", L"HybridCopyQueue", d.hybridCopyQueue, ini);
+    g_cfg.hybridCheck      = IniBool(L"Fix", L"HybridCheck", d.hybridCheck, ini);
+    g_cfg.hybridNoCopy     = IniBool(L"Fix", L"HybridTestNoCopy", d.hybridNoCopy, ini);
+    g_cfg.shadowHeaps      = IniBool(L"Fix", L"ShadowHeaps", d.shadowHeaps, ini);
+    g_cfg.shadowMergeKB    = IniInt(L"Fix", L"ShadowMergeKB", d.shadowMergeKB, ini);
+    g_cfg.shadowNoCopy     = IniBool(L"Fix", L"ShadowTestNoCopy", d.shadowNoCopy, ini);
+    g_cfg.shadowStreamUs   = IniInt(L"Fix", L"ShadowStreamUs", d.shadowStreamUs, ini);
+    g_cfg.shadowStreamMinKB = IniInt(L"Fix", L"ShadowStreamMinKB", d.shadowStreamMinKB, ini);
+    g_cfg.shadowStreamMaxInFlight = IniInt(L"Fix", L"ShadowStreamMaxInFlight", d.shadowStreamMaxInFlight, ini);
+    g_cfg.shadowStreamAll  = IniBool(L"Fix", L"ShadowStreamAllHeaps", d.shadowStreamAll, ini);
+    if (g_cfg.shadowStreamUs != 0) {
+        if (g_cfg.shadowStreamUs < 200) g_cfg.shadowStreamUs = 200;
+        if (g_cfg.shadowStreamUs > 20000) g_cfg.shadowStreamUs = 20000;
+    }
+    if (g_cfg.shadowStreamMinKB < 0) g_cfg.shadowStreamMinKB = 0;
+    if (g_cfg.shadowStreamMaxInFlight < 1) g_cfg.shadowStreamMaxInFlight = 1;
+    if (g_cfg.shadowStreamMaxInFlight > 16) g_cfg.shadowStreamMaxInFlight = 16;
+    if (!g_cfg.shadowHeaps) g_cfg.shadowStreamUs = 0;
+    if (g_cfg.shadowMergeKB < 0) g_cfg.shadowMergeKB = 0;
+    if (g_cfg.shadowMergeKB > 1024) g_cfg.shadowMergeKB = 1024;
+    if (!g_cfg.shadowHeaps) g_cfg.shadowNoCopy = false;
     if (g_cfg.vidmemReserveMB < 0) g_cfg.vidmemReserveMB = 0;
     if (g_cfg.vidmemCapMB < 0) g_cfg.vidmemCapMB = 0;
+    if (g_cfg.hybridSrvCopies < 1) g_cfg.hybridSrvCopies = 1;
+    if (g_cfg.hybridSrvCopies > 16) g_cfg.hybridSrvCopies = 16;
+    if (g_cfg.hybridMergeKB < 0) g_cfg.hybridMergeKB = 0;
+    if (g_cfg.hybridMergeKB > 1024) g_cfg.hybridMergeKB = 1024;
+    if (!g_cfg.hybridHeaps) g_cfg.hybridSrv = g_cfg.hybridCheck = g_cfg.hybridNoCopy = false;
     if (!g_cfg.measure) {
         // Fix-only mode: these need the binding/submit hooks, which are not installed.
         g_cfg.gpuTiming = g_cfg.kmtStats = g_cfg.constPages = false;
+        g_cfg.hybridCheck = false; // needs the per-buffer records
     }
     if (g_cfg.statsIntervalSec < 1) g_cfg.statsIntervalSec = 1;
     // Root CBVs are 256-byte aligned; keep the pad a multiple of that, 256 B .. 4 MB.
@@ -191,11 +222,16 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
 
     ReadConfig(iniPath);
     Log("config: Hooks=%d Measure=%d IntervalSec=%d VidmemHeaps=%d VidmemBuffers=%d VidmemBufMaxKB=%d VidmemReserveMB=%d"
-        " VidmemCapMB=%d VidmemWithReBAR=%d | GpuTiming=%d KmtStats=%d LogCreateLimit=%d TopN=%d ConstPages=%d CbvPad=%d"
-        " LoadPix=%d (ini %s)",
+        " VidmemCapMB=%d VidmemWithReBAR=%d | HybridHeaps=%d HybridSrv=%d HybridSrvCopies=%d HybridMergeKB=%d"
+        " HybridCopyQueue=%d HybridCheck=%d%s | ShadowHeaps=%d ShadowMergeKB=%d ShadowStreamUs=%d ShadowStreamMinKB=%d ShadowStreamMaxInFlight=%d ShadowStreamAllHeaps=%d%s"
+        " | GpuTiming=%d KmtStats=%d LogCreateLimit=%d TopN=%d ConstPages=%d CbvPad=%d LoadPix=%d (ini %s)",
         g_cfg.hooks, g_cfg.measure, g_cfg.statsIntervalSec, g_cfg.vidmemHeaps, g_cfg.vidmemBuffers, g_cfg.vidmemBufMaxKB,
-        g_cfg.vidmemReserveMB, g_cfg.vidmemCapMB, g_cfg.vidmemWithReBAR, g_cfg.gpuTiming, g_cfg.kmtStats,
-        g_cfg.logCreateLimit, g_cfg.topN, g_cfg.constPages, g_cfg.cbvPad, g_cfg.loadPix,
+        g_cfg.vidmemReserveMB, g_cfg.vidmemCapMB, g_cfg.vidmemWithReBAR, g_cfg.hybridHeaps, g_cfg.hybridSrv,
+        g_cfg.hybridSrvCopies, g_cfg.hybridMergeKB, g_cfg.hybridCopyQueue, g_cfg.hybridCheck,
+        g_cfg.hybridNoCopy ? " HybridTestNoCopy=1 (TEST: no copies)" : "",
+        g_cfg.shadowHeaps, g_cfg.shadowMergeKB, g_cfg.shadowStreamUs, g_cfg.shadowStreamMinKB,
+        g_cfg.shadowStreamMaxInFlight, (int)g_cfg.shadowStreamAll, g_cfg.shadowNoCopy ? " ShadowTestNoCopy=1 (TEST: no copies)" : "",
+        g_cfg.gpuTiming, g_cfg.kmtStats, g_cfg.logCreateLimit, g_cfg.topN, g_cfg.constPages, g_cfg.cbvPad, g_cfg.loadPix,
         GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES ? "found" : "missing, defaults");
 
     if (g_cfg.loadPix)
